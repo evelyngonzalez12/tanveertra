@@ -143,15 +143,21 @@ wait_for_devtools() {
   while (( i < max )); do
     if curl -s --max-time 3 http://127.0.0.1:9222/json >/dev/null 2>&1; then
       local count
-      count=$(curl -s --max-time 3 http://127.0.0.1:9222/json 2>/dev/null | python3 -c "import sys,json; print(len([t for t in json.load(sys.stdin) if t.get('type')=='page']))" 2>/dev/null || echo 0)
-      [[ "$count" -gt 0 ]] && { log "DevTools ready (${count} tab(s))"; return 0; }
+      count=$(curl -s --max-time 3 http://127.0.0.1:9222/json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len([t for t in d if t.get('type')=='page']))" 2>/dev/null || echo 0)
+      if [[ "$count" -gt 0 ]]; then
+        log "DevTools ready (${count} tab(s))"
+        return 0
+      fi
     fi
-    sleep 1.5; i=$((i+1))
-    if (( i % 6 == 0 )); then
+    sleep 1.5
+    i=$((i+1))
+    if (( i % 5 == 0 )); then
+      log "DevTools not ready yet (attempt $i/$max) – re-forwarding"
       adb forward --remove tcp:9222 >/dev/null 2>&1 || true
       adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
     fi
   done
+  log "DevTools wait timed out after ${max} attempts"
   return 1
 }
 
@@ -206,10 +212,12 @@ def find_target_tab():
     return None
 
 tab=None
-for _ in range(40):
+for attempt in range(50):
     tab=find_serp_tab()
     if tab: break
-    time.sleep(1.2)
+    if attempt % 10 == 0:
+        print(f"waiting for SERP tab... ({attempt})", flush=True)
+    time.sleep(1.5)
 if not tab:
     print("DevTools tab not reachable",flush=True); sys.exit(2)
 print("attached to:",tab.get("url"),flush=True)
@@ -388,15 +396,36 @@ dump_identity
 resolve_chrome
 skip_chrome_welcome
 
-open_url "$TARGET_URL"; sleep 6; dismiss_chrome_sheets; screenshot "01-bing-home.png"
-open_url "$SEARCH_URL"; sleep 9; dismiss_chrome_sheets; screenshot "02-search-results.png"
-wait_for_devtools 25 || true
+open_url "$TARGET_URL"
+sleep 6
+dismiss_chrome_sheets
+screenshot "01-bing-home.png"
+
+open_url "$SEARCH_URL"
+sleep 10
+dismiss_chrome_sheets
+screenshot "02-search-results.png"
+
+if ! wait_for_devtools 30; then
+  log "DevTools not ready – restart Chrome and retry search page"
+  open_url "$SEARCH_URL"
+  sleep 12
+  dismiss_chrome_sheets
+  if ! wait_for_devtools 35; then
+    log "DevTools still not reachable – aborting"
+    screenshot "03-failed.png"
+    exit 1
+  fi
+fi
 
 log "Starting Bing organic traffic as $IPHONE_NAME"
 if do_organic_and_engage; then
   screenshot "10-engagement-done.png"
   log "SUCCESS – appeared as $IPHONE_NAME"
 else
-  log "FAILED"; screenshot "03-failed.png"; exit 1
+  log "FAILED"
+  screenshot "03-failed.png"
+  exit 1
 fi
-log "done"; ls -la "$ARTIFACTS"
+log "done"
+ls -la "$ARTIFACTS"
