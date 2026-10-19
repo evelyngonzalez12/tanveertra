@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       max_runs:
-        description: "How many traffic runs to send (1–100)"
+        description: "How many traffic runs (1–100)"
         required: true
         default: "20"
         type: string
       search_engine:
-        description: "Which search engine"
+        description: "Search engine"
         required: true
         default: "google"
         type: choice
@@ -18,8 +18,18 @@ on:
           - bing
           - yahoo
           - duckduckgo
+      target_domain:
+        description: "Target domain to click (e.g. gardengar.com)"
+        required: true
+        default: "gardengar.com"
+        type: string
+      keywords:
+        description: "Keywords (one per line or comma-separated). Each run picks one at random."
+        required: true
+        default: "gardengar.com"
+        type: string
       chain_index:
-        description: "Leave as 1 (used automatically for chaining)"
+        description: "Leave as 1 (auto-chaining)"
         required: false
         default: "1"
         type: string
@@ -63,7 +73,6 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -75,30 +84,24 @@ jobs:
         run: |
           ENG="${{ steps.chain.outputs.engine }}"
           mkdir -p scripts/emulator
-
           if [ -f "multi-iphone-organic/${ENG}/spoof-and-capture.sh" ]; then
             cp "multi-iphone-organic/${ENG}/spoof-and-capture.sh" scripts/emulator/spoof-and-capture.sh
-            echo "Using multi-iphone-organic/${ENG}/spoof-and-capture.sh"
-          elif [ -f "scripts/emulator/spoof-and-capture.sh" ]; then
-            echo "Using existing scripts/emulator/spoof-and-capture.sh"
           else
-            echo "ERROR: No iPhone script found for engine $ENG"
-            echo "Expected: multi-iphone-organic/${ENG}/spoof-and-capture.sh"
+            echo "ERROR: multi-iphone-organic/${ENG}/spoof-and-capture.sh missing"
             exit 1
           fi
-
           if [ ! -f "scripts/emulator/patch-avd.sh" ]; then
-            echo "ERROR: scripts/emulator/patch-avd.sh is missing"
+            echo "ERROR: scripts/emulator/patch-avd.sh missing"
             exit 1
           fi
-
           chmod +x scripts/emulator/*.sh
-          ls -la scripts/emulator/
 
       - name: Boot emulator and capture (iPhone UA)
         uses: reactivecircus/android-emulator-runner@v2
         env:
           AVD_NAME: samsung-s24u
+          TARGET_DOMAIN: ${{ github.event.inputs.target_domain }}
+          SEARCH_KEYWORDS: ${{ github.event.inputs.keywords }}
         with:
           api-level: 34
           target: google_apis
@@ -141,7 +144,6 @@ jobs:
             const next = '${{ steps.chain.outputs.next }}';
             const max  = '${{ steps.chain.outputs.max }}';
             const eng  = '${{ steps.chain.outputs.engine }}';
-            console.log(`Dispatching iPhone ${eng} run ${next}/${max}`);
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -150,6 +152,8 @@ jobs:
               inputs: {
                 chain_index: next,
                 max_runs: max,
-                search_engine: eng
+                search_engine: eng,
+                target_domain: '${{ github.event.inputs.target_domain }}',
+                keywords: `${{ github.event.inputs.keywords }}`
               }
             });
