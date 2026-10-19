@@ -1,0 +1,165 @@
+name: Android Organic Capture (multi-device)
+
+on:
+  workflow_dispatch:
+    inputs:
+      chain_index:
+        description: "Start from run number (usually leave 1)"
+        required: false
+        default: "1"
+        type: string
+      max_runs:
+        description: "How many total runs (1–100). Example: 50"
+        required: false
+        default: "20"
+        type: string
+      search_engine:
+        description: "Which search engine"
+        required: true
+        default: "google"
+        type: choice
+        options:
+          - google
+          - bing
+          - yahoo
+          - duckduckgo
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: android-organic-${{ github.event.inputs.search_engine || 'google' }}-${{ github.event.inputs.chain_index || '1' }}
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    name: Android · ${{ github.event.inputs.search_engine }} · run ${{ github.event.inputs.chain_index || '1' }}/${{ github.event.inputs.max_runs || '20' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve chain
+        id: chain
+        run: |
+          IDX="${{ github.event.inputs.chain_index || '1' }}"
+          MAX="${{ github.event.inputs.max_runs || '20' }}"
+          ENG="${{ github.event.inputs.search_engine || 'google' }}"
+          if ! [[ "$MAX" =~ ^[0-9]+$ ]] || [ "$MAX" -lt 1 ]; then MAX=1; fi
+          if [ "$MAX" -gt 100 ]; then MAX=100; fi
+          if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ]; then IDX=1; fi
+          if [ "$IDX" -gt "$MAX" ]; then IDX=1; fi
+          NEXT=$((IDX + 1))
+          echo "index=$IDX" >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "max=$MAX"   >> "$GITHUB_OUTPUT"
+          echo "engine=$ENG" >> "$GITHUB_OUTPUT"
+          echo "Run $IDX / $MAX  engine=$ENG"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare script for selected engine
+        run: |
+          ENG="${{ steps.chain.outputs.engine }}"
+          mkdir -p scripts/emulator
+          # Copy the correct multi-device script
+          if [ -f "multi-device-organic/${ENG}/spoof-and-capture.sh" ]; then
+            cp "multi-device-organic/${ENG}/spoof-and-capture.sh" scripts/emulator/spoof-and-capture.sh
+          elif [ -f "scripts/emulator/spoof-and-capture.sh" ]; then
+            echo "Using existing scripts/emulator/spoof-and-capture.sh"
+          else
+            echo "ERROR: No script found for engine $ENG"
+            exit 1
+          fi
+          chmod +x scripts/emulator/*.sh
+          # patch-avd.sh must exist
+          if [ ! -f scripts/emulator/patch-avd.sh ]; then
+            echo "WARNING: patch-avd.sh missing – creating minimal one"
+            cat > scripts/emulator/patch-avd.sh << 'PATCH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          AVD_NAME="${AVD_NAME:-samsung-s24u}"
+          CONFIG="${HOME}/.android/avd/${AVD_NAME}.avd/config.ini"
+          [ -f "$CONFIG" ] || exit 0
+          set_ini() { local k="$1" v="$2"; grep -qE "^${k}=" "$CONFIG" && sed -i -E "s|^${k}=.*|${k}=${v}|" "$CONFIG" || echo "${k}=${v}" >> "$CONFIG"; }
+          set_ini hw.lcd.width 1080
+          set_ini hw.lcd.height 2340
+          set_ini hw.lcd.density 420
+          set_ini hw.gpu.enabled yes
+          set_ini hw.gpu.mode swiftshader_indirect
+          set_ini hw.ramSize 4096
+          echo "Patched AVD config"
+          PATCH
+            chmod +x scripts/emulator/patch-avd.sh
+          fi
+
+      - name: Boot emulator and capture
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          AVD_NAME: samsung-s24u
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          avd-name: samsung-s24u
+          force-avd-creation: true
+          disable-animations: true
+          disable-spellchecker: true
+          cores: 4
+          ram-size: 4096M
+          heap-size: 512M
+          disk-size: 8G
+          emulator-boot-timeout: 800
+          emulator-options: >-
+            -no-window
+            -gpu swiftshader_indirect
+            -no-snapshot
+            -noaudio
+            -no-boot-anim
+            -writable-system
+            -camera-back emulated
+            -camera-front emulated
+          pre-emulator-launch-script: bash scripts/emulator/patch-avd.sh
+          script: bash scripts/emulator/spoof-and-capture.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ steps.chain.outputs.engine }}-run${{ steps.chain.outputs.index }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Dispatch next run
+        if: success() && steps.chain.outputs.index < steps.chain.outputs.max
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const next = '${{ steps.chain.outputs.next }}';
+            const max  = '${{ steps.chain.outputs.max }}';
+            const eng  = '${{ steps.chain.outputs.engine }}';
+            console.log(`Dispatching ${eng} run ${next}/${max}`);
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'android-organic-capture.yml',
+              ref: context.ref.replace('refs/heads/', ''),
+              inputs: {
+                chain_index: next,
+                max_runs: max,
+                search_engine: eng
+              }
+            });
