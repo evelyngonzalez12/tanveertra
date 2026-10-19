@@ -3,14 +3,9 @@ name: iPhone Organic Capture (multi-device)
 on:
   workflow_dispatch:
     inputs:
-      chain_index:
-        description: "Start from run number (usually leave 1)"
-        required: false
-        default: "1"
-        type: string
       max_runs:
-        description: "How many total runs (1–100). Example: 50"
-        required: false
+        description: "How many traffic runs to send (1–100)"
+        required: true
         default: "20"
         type: string
       search_engine:
@@ -23,6 +18,11 @@ on:
           - bing
           - yahoo
           - duckduckgo
+      chain_index:
+        description: "Leave as 1 (used automatically for chaining)"
+        required: false
+        default: "1"
+        type: string
 
 permissions:
   contents: read
@@ -134,7 +134,7 @@ jobs:
           retention-days: 7
 
       - name: Dispatch next run
-        if: success() && steps.chain.outputs.index < steps.chain.outputs.max
+        if: success() && fromJSON(steps.chain.outputs.index) < fromJSON(steps.chain.outputs.max)
         uses: actions/github-script@v7
         with:
           script: |
