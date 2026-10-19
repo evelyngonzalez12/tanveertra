@@ -327,27 +327,45 @@ FIND_JS = """(() => {
     const r = e.getBoundingClientRect(), st = getComputedStyle(e);
     return r.width > 6 && r.height > 6 && st.visibility !== 'hidden' && st.display !== 'none';
   };
+
+  // Bing organic cards
+  const cards = [
+    ...document.querySelectorAll('li.b_algo, .b_algo, [class*="algo"], article, .b_results > li')
+  ];
+  // Fallback: any block that mentions our domain in text
+  const extra = [...document.querySelectorAll('li, div, section')].filter(el => {
+    const t = (el.innerText || '').toLowerCase();
+    return t.includes(HOST) || t.includes('gardengar');
+  });
+  const blocks = cards.length ? cards : extra;
+
   const candidates = [];
-  for (const a of document.querySelectorAll('a[href]')) {
-    if (!vis(a)) continue;
-    let href = '';
-    try { href = decodeURIComponent(a.href || '').toLowerCase(); } catch(e) {
-      href = (a.href || '').toLowerCase();
+  for (const card of blocks) {
+    const text = (card.innerText || '').toLowerCase();
+    if (!text.includes(HOST) && !text.includes('gardengar')) continue;
+
+    // Prefer real outbound link; else title link inside card
+    let a = [...card.querySelectorAll('a[href]')].find(x => {
+      const h = (x.href || '').toLowerCase();
+      return h.includes(HOST) && !h.includes('bing.com');
+    });
+    if (!a) {
+      a = card.querySelector('h2 a, h3 a, a[hres], a') || card.querySelector('a[href]');
     }
-    const text = ((a.innerText || '') + ' ' + (a.textContent || '') + ' ' +
-                  (a.getAttribute('aria-label') || '')).toLowerCase();
-    // MUST be our domain only
-    const hasHost = href.includes(HOST) || text.includes(HOST) ||
-                    text.includes('gardengar') || href.includes('gardengar');
-    if (!hasHost) continue;
-    let score = 20;
-    if (href.includes(HOST) && !href.includes('bing.com')) score += 15;
-    if (a.querySelector('h2, h3, [role=heading]')) score += 8;
+    if (!a || !vis(a)) continue;
+
+    let score = 25; // domain in card text
+    const href = (a.href || '').toLowerCase();
+    if (href.includes(HOST)) score += 15;
+    if (a.querySelector('h2, h3') || a.closest('h2, h3')) score += 8;
     for (const t of TOKENS) {
-      if (text.includes(t)) score += 3;
+      if (text.includes(t)) score += 2;
     }
-    const titleEl = a.querySelector('h2, h3, [role=heading]') || a;
+
+    const titleEl = card.querySelector('h2, h3, [role=heading]') || a;
     const r = titleEl.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) continue;
+
     candidates.push({
       tag: titleEl.tagName,
       text: (titleEl.innerText || a.innerText || '').trim().slice(0, 120),
@@ -357,9 +375,10 @@ FIND_JS = """(() => {
       score
     });
   }
+
   candidates.sort((x, y) => y.score - x.score);
-  const titles = [...document.querySelectorAll('h2, h3, [role=heading]')]
-    .map(e => (e.innerText || '').trim()).filter(Boolean).slice(0, 12);
+  const titles = [...document.querySelectorAll('h2, h3, [role=heading], cite')]
+    .map(e => (e.innerText || '').trim()).filter(Boolean).slice(0, 20);
   return JSON.stringify({
     found: candidates[0] || null,
     count: candidates.length,
