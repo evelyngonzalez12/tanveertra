@@ -63,6 +63,7 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -74,33 +75,25 @@ jobs:
         run: |
           ENG="${{ steps.chain.outputs.engine }}"
           mkdir -p scripts/emulator
+
           if [ -f "multi-iphone-organic/${ENG}/spoof-and-capture.sh" ]; then
             cp "multi-iphone-organic/${ENG}/spoof-and-capture.sh" scripts/emulator/spoof-and-capture.sh
+            echo "Using multi-iphone-organic/${ENG}/spoof-and-capture.sh"
           elif [ -f "scripts/emulator/spoof-and-capture.sh" ]; then
             echo "Using existing scripts/emulator/spoof-and-capture.sh"
           else
             echo "ERROR: No iPhone script found for engine $ENG"
+            echo "Expected: multi-iphone-organic/${ENG}/spoof-and-capture.sh"
             exit 1
           fi
-          chmod +x scripts/emulator/*.sh
-          if [ ! -f scripts/emulator/patch-avd.sh ]; then
-            cat > scripts/emulator/patch-avd.sh << 'PATCH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          AVD_NAME="${AVD_NAME:-samsung-s24u}"
-          CONFIG="${HOME}/.android/avd/${AVD_NAME}.avd/config.ini"
-          [ -f "$CONFIG" ] || exit 0
-          set_ini() { local k="$1" v="$2"; grep -qE "^${k}=" "$CONFIG" && sed -i -E "s|^${k}=.*|${k}=${v}|" "$CONFIG" || echo "${k}=${v}" >> "$CONFIG"; }
-          set_ini hw.lcd.width 1080
-          set_ini hw.lcd.height 2340
-          set_ini hw.lcd.density 420
-          set_ini hw.gpu.enabled yes
-          set_ini hw.gpu.mode swiftshader_indirect
-          set_ini hw.ramSize 4096
-          echo "Patched AVD config"
-          PATCH
-            chmod +x scripts/emulator/patch-avd.sh
+
+          if [ ! -f "scripts/emulator/patch-avd.sh" ]; then
+            echo "ERROR: scripts/emulator/patch-avd.sh is missing"
+            exit 1
           fi
+
+          chmod +x scripts/emulator/*.sh
+          ls -la scripts/emulator/
 
       - name: Boot emulator and capture (iPhone UA)
         uses: reactivecircus/android-emulator-runner@v2
