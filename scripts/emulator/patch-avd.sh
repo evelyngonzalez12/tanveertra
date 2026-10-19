@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # Runs after the AVD is created and before QEMU boots.
-# Rewrites the virtual panel to Galaxy S24 Ultra factory FHD+ (1080x2340 @ 420dpi).
+# One shared panel for all engines (Android + iPhone UA scripts).
 set -euo pipefail
+
 AVD_NAME="${AVD_NAME:-samsung-s24u}"
 AVD_DIR="${HOME}/.android/avd/${AVD_NAME}.avd"
 CONFIG="${AVD_DIR}/config.ini"
+
 if [[ ! -f "$CONFIG" ]]; then
   echo "AVD config not found at ${CONFIG}" >&2
   ls -la "${HOME}/.android/avd" >&2 || true
   exit 1
 fi
+
 set_ini() {
   local key="$1" val="$2"
   if grep -qE "^${key}=" "$CONFIG"; then
@@ -18,7 +21,8 @@ set_ini() {
     printf '%s=%s\n' "$key" "$val" >> "$CONFIG"
   fi
 }
-# S24 Ultra ships FHD+ by default (QHD+ is optional in settings).
+
+# Stable FHD+ phone panel (works for all device spoofs)
 set_ini hw.lcd.width 1080
 set_ini hw.lcd.height 2340
 set_ini hw.lcd.depth 16
@@ -49,5 +53,6 @@ set_ini hw.device.name "Galaxy S24 Ultra"
 set_ini hw.device.manufacturer Samsung
 set_ini skin.dynamic yes
 set_ini showDeviceFrame no
+
 echo "Patched ${CONFIG} to Galaxy S24 Ultra FHD+"
 cat "$CONFIG"
