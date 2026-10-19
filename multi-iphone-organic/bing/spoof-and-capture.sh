@@ -314,11 +314,10 @@ cdp("Network.setUserAgentOverride",
 print("iPhone UA applied:", IPHONE_NAME, flush=True)
 
 # ---------- BING ORGANIC CLICK (improved matcher) ----------
-print("=== BING ORGANIC CLICK ===", flush=True)
+print("=== BING ORGANIC CLICK (up to 3 SERP pages) ===", flush=True)
 print(f"Looking for domain={HOST} keyword={TARGET}", flush=True)
 
 KW_TOKENS = [w for w in TARGET.replace("-", " ").split() if len(w) > 2][:8]
-# Keep original SERP URL so we can return after a bad tap
 SERP_URL = js("location.href") or ""
 
 FIND_JS = """(() => {
@@ -337,19 +336,16 @@ FIND_JS = """(() => {
     }
     const text = ((a.innerText || '') + ' ' + (a.textContent || '') + ' ' +
                   (a.getAttribute('aria-label') || '')).toLowerCase();
-
-    // MUST be our domain — never other sites
+    // MUST be our domain only
     const hasHost = href.includes(HOST) || text.includes(HOST) ||
                     text.includes('gardengar') || href.includes('gardengar');
     if (!hasHost) continue;
-
-    let score = 20;  // base for domain match
+    let score = 20;
     if (href.includes(HOST) && !href.includes('bing.com')) score += 15;
     if (a.querySelector('h2, h3, [role=heading]')) score += 8;
     for (const t of TOKENS) {
       if (text.includes(t)) score += 3;
     }
-
     const titleEl = a.querySelector('h2, h3, [role=heading]') || a;
     const r = titleEl.getBoundingClientRect();
     candidates.push({
@@ -363,7 +359,7 @@ FIND_JS = """(() => {
   }
   candidates.sort((x, y) => y.score - x.score);
   const titles = [...document.querySelectorAll('h2, h3, [role=heading]')]
-    .map(e => (e.innerText || '').trim()).filter(Boolean).slice(0, 15);
+    .map(e => (e.innerText || '').trim()).filter(Boolean).slice(0, 12);
   return JSON.stringify({
     found: candidates[0] || null,
     count: candidates.length,
@@ -375,6 +371,38 @@ FIND_JS = """(() => {
   });
 })()""" % (json.dumps(HOST), json.dumps(KW_TOKENS))
 
+NEXT_JS = """(() => {
+  const vis = e => {
+    const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+    return r.width > 8 && r.height > 8 && st.visibility !== 'hidden' && st.display !== 'none';
+  };
+  const labels = ['next', 'next page', '›', '>', '下一页'];
+  for (const a of document.querySelectorAll('a, button, [role=button], [role=link]')) {
+    if (!vis(a)) continue;
+    const t = ((a.innerText || '') + ' ' + (a.getAttribute('aria-label') || '') +
+               ' ' + (a.getAttribute('title') || '')).trim().toLowerCase();
+    if (labels.some(l => t === l || t.startsWith('next'))) {
+      const r = a.getBoundingClientRect();
+      return JSON.stringify({
+        x: r.left + r.width / 2,
+        y: r.top + r.height / 2,
+        text: t.slice(0, 40)
+      });
+    }
+  }
+  // Bing often uses sb_pagN / "Next"
+  for (const a of document.querySelectorAll('a[href*="first="], a.sb_pagN, a[aria-label*="Next" i]')) {
+    if (!vis(a)) continue;
+    const r = a.getBoundingClientRect();
+    return JSON.stringify({
+      x: r.left + r.width / 2,
+      y: r.top + r.height / 2,
+      text: (a.innerText || 'next').slice(0, 40)
+    });
+  }
+  return 'null';
+})()"""
+
 def smooth_scroll(dist, x, y):
     cdp("Input.synthesizeScrollGesture", x=x, y=y, yDistance=-dist,
         speed=450, gestureSourceType="touch")
@@ -384,136 +412,182 @@ def is_target(url):
     u = (url or "").lower()
     return HOST in u and "bing." not in u and "chrome-error" not in u
 
-def back_to_serp():
-    """Return to Bing results after a wrong/missed tap."""
-    print("  returning to SERP...", flush=True)
+def ensure_on_serp():
+    try:
+        cur = (js("location.href") or "").lower()
+        if "bing." in cur and "search" in cur:
+            return True
+        if is_target(cur):
+            return False  # already on site
+    except Exception:
+        pass
+    print("  navigating back to SERP...", flush=True)
     try:
         cdp("Page.navigate", url=SERP_URL)
         time.sleep(4)
     except Exception:
         pass
-    # re-attach if needed
-    t = find_serp_tab()
-    if t:
-        global tab, ws
+    return True
+
+def try_find_and_click_on_current_page(page_num):
+    """Scroll current SERP page looking for domain. Returns True if landed on target."""
+    print(f"\n--- SERP page {page_num}/3 ---", flush=True)
+    stale_bottom = 0
+    for attempt in range(45):
+        if not ensure_on_serp():
+            # already on target
+            return True
         try:
-            ws.close()
+            cur = (js("location.href") or "").lower()
+            if is_target(cur):
+                print("SUCCESS: on target", flush=True)
+                return True
         except Exception:
             pass
-        tab = t
-        ws = websocket.create_connection(
-            tab["webSocketDebuggerUrl"], timeout=120,
-            suppress_origin=True, ping_interval=12, ping_timeout=8
-        )
-        cdp("Page.enable")
-        cdp("Runtime.enable")
-        cdp("Network.enable")
-        cdp("Network.setUserAgentOverride", userAgent=IPHONE_UA, platform="iPhone")
 
-success = False
-stale_bottom = 0
+        info = json.loads(js(FIND_JS) or "{}")
+        found = info.get("found")
+        H = info.get("innerH", 800)
+        W = info.get("innerW", 400)
+        scrollY = info.get("scrollY", 0)
+        maxY = info.get("maxY", 0)
 
-for attempt in range(70):
-    # Still on Bing?
-    try:
-        cur = (js("location.href") or "").lower()
-        if "bing." not in cur and HOST not in cur:
-            back_to_serp()
-            continue
-        if is_target(cur):
-            print("SUCCESS: already on target", flush=True)
-            success = True
-            break
-    except Exception:
-        pass
+        if attempt % 8 == 0:
+            print(f"  candidates={info.get('count', 0)} scroll={scrollY:.0f}/{maxY:.0f}", flush=True)
+            if info.get("titles"):
+                print(f"  titles: {info.get('titles')[:4]}", flush=True)
 
-    info = json.loads(js(FIND_JS) or "{}")
-    found = info.get("found")
-    H = info.get("innerH", 800)
-    W = info.get("innerW", 400)
-    scrollY = info.get("scrollY", 0)
-    maxY = info.get("maxY", 0)
-
-    if attempt % 6 == 0:
-        print(f"  titles sample: {info.get('titles', [])[:5]}", flush=True)
-        print(f"  domain candidates: {info.get('count', 0)}  scrollY={scrollY:.0f}/{maxY:.0f}", flush=True)
-
-    if found and 40 < found["y"] < H - 40:
-        print(f"found domain result '{found['text']}' score={found.get('score')}", flush=True)
-        cdp("Input.synthesizeTapGesture", x=found["x"], y=found["y"])
-        print("real organic tap", flush=True)
-
-        landed = False
-        for w in range(18):
-            time.sleep(1.3)
-            try:
-                now = (js("location.href") or "").lower()
-                if is_target(now):
-                    print("SUCCESS: organic landing →", now[:90], flush=True)
-                    success = True
-                    landed = True
-                    break
-            except Exception:
-                pass
-            t = find_target_tab()
-            if t:
+        if found and 40 < found["y"] < H - 40:
+            print(f"found '{found['text']}' score={found.get('score')}", flush=True)
+            cdp("Input.synthesizeTapGesture", x=found["x"], y=found["y"])
+            print("real organic tap", flush=True)
+            for w in range(18):
+                time.sleep(1.3)
                 try:
-                    ws.close()
+                    now = (js("location.href") or "").lower()
+                    if is_target(now):
+                        print("SUCCESS: organic landing →", now[:90], flush=True)
+                        return True
                 except Exception:
                     pass
-                tab = t
-                ws = websocket.create_connection(
-                    tab["webSocketDebuggerUrl"], timeout=120,
-                    suppress_origin=True, ping_interval=12, ping_timeout=8
-                )
-                cdp("Page.enable")
-                cdp("Runtime.enable")
-                cdp("Network.enable")
-                cdp("Network.setUserAgentOverride", userAgent=IPHONE_UA, platform="iPhone")
-                success = True
-                landed = True
-                break
-
-        if success:
-            break
-        if not landed:
-            print("  tap did not land on target domain – back to SERP", flush=True)
-            back_to_serp()
-            time.sleep(2)
+                t = find_target_tab()
+                if t:
+                    global tab, ws
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    tab = t
+                    ws = websocket.create_connection(
+                        tab["webSocketDebuggerUrl"], timeout=120,
+                        suppress_origin=True, ping_interval=12, ping_timeout=8
+                    )
+                    cdp("Page.enable"); cdp("Runtime.enable"); cdp("Network.enable")
+                    cdp("Network.setUserAgentOverride", userAgent=IPHONE_UA, platform="iPhone")
+                    print("SUCCESS: target tab", flush=True)
+                    return True
+            print("  tap missed domain – stay on SERP / go back", flush=True)
+            ensure_on_serp()
+            time.sleep(1.5)
             continue
-    else:
-        # Keep scrolling; do not give up early
+
         if found:
-            # Off-screen domain result – scroll toward it
             smooth_scroll(int(found["y"] - H / 2), int(W / 2), int(H * 0.55))
         else:
-            if maxY > 0 and scrollY >= maxY - 30:
+            if maxY > 0 and scrollY >= maxY - 40:
                 stale_bottom += 1
-                if stale_bottom >= 4:
-                    print("Reached bottom of SERP – no gardengar.com result", flush=True)
+                if stale_bottom >= 3:
+                    print(f"  end of SERP page {page_num}", flush=True)
                     break
-                # Try small bounce up then down again (lazy-load)
-                smooth_scroll(-int(H * 0.3), int(W / 2), int(H * 0.5))
-                time.sleep(0.8)
+                smooth_scroll(-int(H * 0.25), int(W / 2), int(H * 0.5))
+                time.sleep(0.7)
             else:
                 stale_bottom = 0
             smooth_scroll(int(H * 0.38), int(W / 2), int(H * 0.62))
+    return False
+
+def go_to_next_serp_page():
+    """Tap Bing Next. Returns True if navigation likely happened."""
+    print("  looking for Next page control...", flush=True)
+    # Scroll near bottom so Next is visible
+    for _ in range(4):
+        info = json.loads(js(FIND_JS) or "{}")
+        H = info.get("innerH", 800)
+        W = info.get("innerW", 400)
+        maxY = info.get("maxY", 0)
+        scrollY = info.get("scrollY", 0)
+        if maxY > 0 and scrollY >= maxY - 80:
+            break
+        smooth_scroll(int(H * 0.45), int(W / 2), int(H * 0.65))
+
+    raw = js(NEXT_JS) or "null"
+    if raw == "null" or raw is None:
+        print("  Next control not found", flush=True)
+        return False
+    try:
+        nxt = json.loads(raw)
+    except Exception:
+        print("  Next parse failed", flush=True)
+        return False
+    print(f"  tapping Next: {nxt.get('text')}", flush=True)
+    old = (js("location.href") or "")
+    cdp("Input.synthesizeTapGesture", x=nxt["x"], y=nxt["y"])
+    time.sleep(4.5)
+    new = (js("location.href") or "")
+    if new != old or "first=" in new.lower() or "first=" in (js("location.href") or "").lower():
+        print("  moved to next SERP page", flush=True)
+        time.sleep(2)
+        return True
+    # soft navigate via URL first= param if still same
+    try:
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        u = urlparse(old)
+        qs = parse_qs(u.query)
+        first = int(qs.get("first", ["1"])[0])
+        qs["first"] = [str(first + 10)]
+        new_q = urlencode({k: v[0] if len(v) == 1 else v for k, v in qs.items()}, doseq=True)
+        next_url = urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
+        cdp("Page.navigate", url=next_url)
+        time.sleep(4)
+        print("  navigated via first= param", flush=True)
+        return True
+    except Exception as e:
+        print(f"  next page fallback failed: {e}", flush=True)
+        return False
+
+# ----- try up to 3 SERP pages -----
+success = False
+for page_num in range(1, 4):
+    if try_find_and_click_on_current_page(page_num):
+        success = True
+        break
+    if page_num < 3:
+        if not go_to_next_serp_page():
+            print("  cannot open next page – stop SERP search", flush=True)
+            break
+        SERP_URL = js("location.href") or SERP_URL
 
 if not success:
-    print("FAILED organic click – domain not found on this SERP", flush=True)
+    # Soft skip: do NOT fail the job so chain continues
+    print("SKIP: domain not found on 3 SERP pages – continuing chain", flush=True)
     try:
         with open(os.path.join(ARTIFACTS, "page-debug.json"), "w") as f:
             f.write(js(FIND_JS) or "{}")
     except Exception:
         pass
-    sys.exit(1)
+    subprocess.run(["adb", "exec-out", "screencap", "-p"],
+                   stdout=open(os.path.join(ARTIFACTS, "03-skipped-no-result.png"), "wb"),
+                   check=False)
+    ws.close()
+    print("SOFT_EXIT_SKIP", flush=True)
+    sys.exit(0)   # success for GitHub → next run is dispatched
 
+# --- only if success: screenshots + engagement (keep your existing engagement code below) ---
 subprocess.run(["adb", "exec-out", "screencap", "-p"],
                stdout=open(os.path.join(ARTIFACTS, "03-organic-landed.png"), "wb"), check=False)
 time.sleep(2)
 subprocess.run(["adb", "exec-out", "screencap", "-p"],
                stdout=open(os.path.join(ARTIFACTS, "04-organic-settled.png"), "wb"), check=False)
-
 # ---------- ENGAGEMENT ----------
 print("\n=== ENGAGEMENT ===", flush=True)
 
