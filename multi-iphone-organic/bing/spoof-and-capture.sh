@@ -7,14 +7,41 @@ ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 ARTIFACTS="${ROOT}/artifacts"
 mkdir -p "$ARTIFACTS"
 
+
+
+
 CHROME_PKG="com.android.chrome"
-TARGET_URL="https://www.bing.com"
-SEARCH_URL="https://www.bing.com/search?q=slugs+vs+birds+vs+mice"
-RESULT_HOST="gardengar.com"
-RESULT_TEXT="strawberries"
 HAVE_ROOT=0
 
 log() { printf '[capture] %s\n' "$*"; }
+
+
+# ---- keywords / domain from GitHub Actions inputs (env) ----
+RESULT_HOST="${TARGET_DOMAIN:-gardengar.com}"
+RESULT_HOST="${RESULT_HOST#www.}"
+RESULT_HOST="${RESULT_HOST#https://}"
+RESULT_HOST="${RESULT_HOST#http://}"
+RESULT_HOST="${RESULT_HOST%%/*}"
+
+RAW_KEYWORDS="${SEARCH_KEYWORDS:-gardengar.com}"
+KEYWORDS_FILE="$(mktemp)"
+printf '%s\n' "$RAW_KEYWORDS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' > "$KEYWORDS_FILE" || true
+if [[ ! -s "$KEYWORDS_FILE" ]]; then
+  echo "gardengar.com" > "$KEYWORDS_FILE"
+fi
+mapfile -t KW_ARR < "$KEYWORDS_FILE"
+rm -f "$KEYWORDS_FILE"
+PICKED_KEYWORD="${KW_ARR[RANDOM % ${#KW_ARR[@]}]}"
+log "Target domain: $RESULT_HOST"
+log "Keyword pool (${#KW_ARR[@]}): ${KW_ARR[*]}"
+log "Picked keyword for this run: $PICKED_KEYWORD"
+
+ENCODED_KEYWORD="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$PICKED_KEYWORD")"
+
+SEARCH_URL="https://www.bing.com/search?q=${ENCODED_KEYWORD}"
+TARGET_URL="https://www.bing.com"
+RESULT_TEXT="$PICKED_KEYWORD"
+export RESULT_HOST RESULT_TEXT SEARCH_URL TARGET_URL
 adb_sh() { adb shell "$@" | tr -d '\r'; }
 
 wait_for_boot() {
