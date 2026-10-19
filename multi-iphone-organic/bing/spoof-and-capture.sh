@@ -1,20 +1,17 @@
 #!/usr/bin/env bash
 # Bing organic traffic – randomly rotates multiple iPhone / iOS devices
-# Spoofs iPhone User-Agent + Client Hints via CDP (runs on Android emulator)
+# Keywords + target domain come from GitHub Actions env (TARGET_DOMAIN, SEARCH_KEYWORDS)
+# Spoofs iPhone User-Agent via CDP (runs on Android emulator)
 set -euo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 ARTIFACTS="${ROOT}/artifacts"
 mkdir -p "$ARTIFACTS"
 
-
-
-
 CHROME_PKG="com.android.chrome"
 HAVE_ROOT=0
 
 log() { printf '[capture] %s\n' "$*"; }
-
 
 # ---- keywords / domain from GitHub Actions inputs (env) ----
 RESULT_HOST="${TARGET_DOMAIN:-gardengar.com}"
@@ -31,17 +28,18 @@ if [[ ! -s "$KEYWORDS_FILE" ]]; then
 fi
 mapfile -t KW_ARR < "$KEYWORDS_FILE"
 rm -f "$KEYWORDS_FILE"
+
 PICKED_KEYWORD="${KW_ARR[RANDOM % ${#KW_ARR[@]}]}"
 log "Target domain: $RESULT_HOST"
 log "Keyword pool (${#KW_ARR[@]}): ${KW_ARR[*]}"
 log "Picked keyword for this run: $PICKED_KEYWORD"
 
 ENCODED_KEYWORD="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$PICKED_KEYWORD")"
-
 SEARCH_URL="https://www.bing.com/search?q=${ENCODED_KEYWORD}"
 TARGET_URL="https://www.bing.com"
 RESULT_TEXT="$PICKED_KEYWORD"
 export RESULT_HOST RESULT_TEXT SEARCH_URL TARGET_URL
+
 adb_sh() { adb shell "$@" | tr -d '\r'; }
 
 wait_for_boot() {
@@ -67,9 +65,7 @@ ensure_root() {
   log "no root"; return 1
 }
 
-# ---------- Random iPhone profiles ----------
 pick_iphone_profile() {
-  # format: model_id|marketing_name|viewport|dpr|ios_version
   local profiles=(
     "iPhone15,2|iPhone 14 Pro|390x844|3|17_0"
     "iPhone15,3|iPhone 14 Pro Max|430x932|3|17_0"
@@ -84,7 +80,6 @@ pick_iphone_profile() {
   )
   local choice="${profiles[RANDOM % ${#profiles[@]}]}"
   IFS='|' read -r IPHONE_MODEL IPHONE_NAME VIEWPORT DPR IOS_VER <<< "$choice"
-  # Build realistic Safari UA
   IPHONE_UA="Mozilla/5.0 (iPhone; CPU iPhone OS ${IOS_VER//_/_} like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
   log "Selected iPhone: $IPHONE_NAME ($IPHONE_MODEL)  iOS $IOS_VER  viewport $VIEWPORT"
 }
@@ -104,6 +99,8 @@ dump_identity() {
     echo "viewport=$VIEWPORT"
     echo "dpr=$DPR"
     echo "ios=$IOS_VER"
+    echo "keyword=$PICKED_KEYWORD"
+    echo "domain=$RESULT_HOST"
   } | tee "$ARTIFACTS/identity.txt"
 }
 
@@ -204,210 +201,377 @@ settle_device() {
 }
 
 do_organic_and_engage() {
-  python3 -m pip install -q websocket-client --break-system-packages >/dev/null 2>&1 || python3 -m pip install -q websocket-client >/dev/null 2>&1 || true
+  python3 -m pip install -q websocket-client --break-system-packages >/dev/null 2>&1 \
+    || python3 -m pip install -q websocket-client >/dev/null 2>&1 || true
+
   adb forward --remove tcp:9222 >/dev/null 2>&1 || true
   adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
 
   export IPHONE_UA IPHONE_NAME
   RESULT_HOST="$RESULT_HOST" RESULT_TEXT="$RESULT_TEXT" ARTIFACTS="$ARTIFACTS" \
   IPHONE_UA="$IPHONE_UA" IPHONE_NAME="$IPHONE_NAME" python3 - <<'PY'
-import json,os,sys,time,random,urllib.request,subprocess
+import json, os, sys, time, random, urllib.request, subprocess
 import websocket
-HOST=os.environ["RESULT_HOST"].strip().lower()
-TARGET=os.environ["RESULT_TEXT"].strip().lower()
-ARTIFACTS=os.environ["ARTIFACTS"]
-IPHONE_UA=os.environ.get("IPHONE_UA","")
-IPHONE_NAME=os.environ.get("IPHONE_NAME","iPhone")
-NUM_PAGES=random.randint(4,6)
-MIN_DWELL,MAX_DWELL=55,110
+
+HOST = os.environ["RESULT_HOST"].strip().lower()
+TARGET = os.environ["RESULT_TEXT"].strip().lower()
+ARTIFACTS = os.environ["ARTIFACTS"]
+IPHONE_UA = os.environ.get("IPHONE_UA", "")
+IPHONE_NAME = os.environ.get("IPHONE_NAME", "iPhone")
+
+NUM_PAGES = random.randint(4, 6)
+MIN_DWELL, MAX_DWELL = 55, 110
 
 def get_tabs():
-    with urllib.request.urlopen("http://127.0.0.1:9222/json",timeout=8) as r: return json.loads(r.read().decode())
+    with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=8) as r:
+        return json.loads(r.read().decode())
+
 def find_serp_tab():
     try:
-        pages=[t for t in get_tabs() if t.get("type")=="page"]
-        pages.sort(key=lambda t:0 if "bing." in t.get("url","").lower() else 1)
+        pages = [t for t in get_tabs() if t.get("type") == "page"]
+        pages.sort(key=lambda t: 0 if "bing." in t.get("url", "").lower() else 1)
         return pages[0] if pages else None
-    except: return None
+    except Exception:
+        return None
+
 def find_target_tab():
     try:
         for t in get_tabs():
-            if t.get("type")!="page": continue
-            u=t.get("url","").lower()
-            if HOST in u and "bing." not in u and "chrome-error" not in u: return t
-    except: pass
+            if t.get("type") != "page":
+                continue
+            u = t.get("url", "").lower()
+            if HOST in u and "bing." not in u and "chrome-error" not in u:
+                return t
+    except Exception:
+        pass
     return None
 
-tab=None
+tab = None
 for attempt in range(50):
-    tab=find_serp_tab()
-    if tab: break
+    tab = find_serp_tab()
+    if tab:
+        break
     if attempt % 10 == 0:
         print(f"waiting for SERP tab... ({attempt})", flush=True)
     time.sleep(1.5)
-if not tab:
-    print("DevTools tab not reachable",flush=True); sys.exit(2)
-print("attached to:",tab.get("url"),flush=True)
-print("Spoofing as:",IPHONE_NAME,flush=True)
 
-ws=websocket.create_connection(tab["webSocketDebuggerUrl"],timeout=120,suppress_origin=True,ping_interval=12,ping_timeout=8)
-_id=0
-def cdp(method,**params):
-    global _id,ws,tab
+if not tab:
+    print("DevTools tab not reachable", flush=True)
+    sys.exit(2)
+
+print("attached to:", tab.get("url"), flush=True)
+print("Spoofing as:", IPHONE_NAME, flush=True)
+
+ws = websocket.create_connection(
+    tab["webSocketDebuggerUrl"],
+    timeout=120, suppress_origin=True,
+    ping_interval=12, ping_timeout=8
+)
+
+_id = 0
+def cdp(method, **params):
+    global _id, ws, tab
     for attempt in range(4):
         try:
-            _id+=1
-            ws.send(json.dumps({"id":_id,"method":method,"params":params}))
-            deadline=time.time()+25
-            while time.time()<deadline:
-                msg=json.loads(ws.recv())
-                if msg.get("id")==_id: return msg.get("result",{})
+            _id += 1
+            ws.send(json.dumps({"id": _id, "method": method, "params": params}))
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                msg = json.loads(ws.recv())
+                if msg.get("id") == _id:
+                    return msg.get("result", {})
         except Exception as e:
-            print(f"CDP error ({attempt+1}): {e}",flush=True)
-            try: ws.close()
-            except: pass
+            print(f"CDP error ({attempt+1}): {e}", flush=True)
+            try:
+                ws.close()
+            except Exception:
+                pass
             time.sleep(2)
-            new=find_target_tab() or find_serp_tab()
-            if not new: raise
-            tab=new
-            ws=websocket.create_connection(tab["webSocketDebuggerUrl"],timeout=120,suppress_origin=True,ping_interval=12,ping_timeout=8)
+            new = find_target_tab() or find_serp_tab()
+            if not new:
+                raise
+            tab = new
+            ws = websocket.create_connection(
+                tab["webSocketDebuggerUrl"],
+                timeout=120, suppress_origin=True,
+                ping_interval=12, ping_timeout=8
+            )
     raise RuntimeError("CDP failed")
+
 def js(expr):
-    r=cdp("Runtime.evaluate",expression=expr,returnByValue=True)
-    return r.get("result",{}).get("value")
+    r = cdp("Runtime.evaluate", expression=expr, returnByValue=True)
+    return r.get("result", {}).get("value")
 
-cdp("Page.enable"); cdp("Runtime.enable"); cdp("Network.enable")
+cdp("Page.enable")
+cdp("Runtime.enable")
+cdp("Network.enable")
 
-# Apply iPhone User-Agent
-print("Applying iPhone UA...",flush=True)
+print("Applying iPhone UA...", flush=True)
 cdp("Network.setUserAgentOverride",
     userAgent=IPHONE_UA,
     platform="iPhone",
     acceptLanguage="en-US,en;q=0.9")
-print("iPhone UA applied:",IPHONE_NAME,flush=True)
+print("iPhone UA applied:", IPHONE_NAME, flush=True)
 
-print("=== BING ORGANIC CLICK ===",flush=True)
-FIND_JS="""(() => {
-  const HOST=%s, TEXT=%s;
-  const vis=e=>{const r=e.getBoundingClientRect(),st=getComputedStyle(e);return r.width>4&&r.height>4&&st.visibility!=='hidden'&&st.display!=='none';};
-  const points=a=>{try{const h=decodeURIComponent(a.href||'').toLowerCase();
-    if(h.includes(HOST))return true;
-    const t=((a.innerText||'')+' '+(a.textContent||'')).toLowerCase();
-    return t.includes(HOST)||(t.includes(TEXT)&&t.length<90);}catch(e){return false;}};
-  const links=[...document.querySelectorAll('a[href]')].filter(a=>points(a)&&vis(a));
-  const score=a=>{let s=0;const t=(a.innerText||'').trim().toLowerCase();
-    if(a.querySelector('h3,[role=heading]'))s+=8;
-    if(t.includes(HOST)||t.includes(TEXT))s+=5;
-    if((a.href||'').includes(HOST))s+=4;return s;};
-  links.sort((x,y)=>score(y)-score(x));
-  let best=null;
-  if(links.length){const a=links[0];const t=a.querySelector('h3,[role=heading]')||a;const r=t.getBoundingClientRect();
-    best={tag:t.tagName,text:(t.innerText||'').trim().slice(0,100),href:a.href,x:r.left+r.width/2,y:r.top+r.height/2,score:score(a)};}
-  return JSON.stringify({found:best,innerH:window.innerHeight,innerW:window.innerWidth,scrollY:window.scrollY,maxY:document.documentElement.scrollHeight-window.innerHeight});
-})()"""%(json.dumps(HOST),json.dumps(TARGET))
+# ---------- BING ORGANIC CLICK (improved matcher) ----------
+print("=== BING ORGANIC CLICK ===", flush=True)
+print(f"Looking for domain={HOST} keyword={TARGET}", flush=True)
 
-def smooth_scroll(dist,x,y):
-    cdp("Input.synthesizeScrollGesture",x=x,y=y,yDistance=-dist,speed=480,gestureSourceType="touch"); time.sleep(1.1)
+KW_TOKENS = [w for w in TARGET.replace("-", " ").split() if len(w) > 2][:8]
+
+FIND_JS = """(() => {
+  const HOST = %s;
+  const TOKENS = %s;
+  const vis = e => {
+    const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+    return r.width > 6 && r.height > 6 && st.visibility !== 'hidden' && st.display !== 'none';
+  };
+  const candidates = [];
+  for (const a of document.querySelectorAll('a[href]')) {
+    if (!vis(a)) continue;
+    let href = '';
+    try { href = decodeURIComponent(a.href || '').toLowerCase(); } catch(e) { href = (a.href || '').toLowerCase(); }
+    const text = ((a.innerText || '') + ' ' + (a.textContent || '') + ' ' + (a.getAttribute('aria-label') || '')).toLowerCase();
+    const hasHost = href.includes(HOST) || text.includes(HOST) || text.includes('gardengar');
+    if (!hasHost && !TOKENS.some(t => text.includes(t))) continue;
+
+    let score = 0;
+    if (hasHost) score += 20;
+    if (href.includes(HOST) && !href.includes('bing.com')) score += 12;
+    if (a.querySelector('h2, h3, [role=heading]')) score += 10;
+    for (const t of TOKENS) {
+      if (text.includes(t)) score += 4;
+    }
+    if (text.includes('gardengar')) score += 6;
+
+    if (score >= 12) {
+      const titleEl = a.querySelector('h2, h3, [role=heading]') || a;
+      const r = titleEl.getBoundingClientRect();
+      candidates.push({
+        tag: titleEl.tagName,
+        text: (titleEl.innerText || a.innerText || '').trim().slice(0, 120),
+        href: a.href,
+        x: r.left + r.width / 2,
+        y: r.top + r.height / 2,
+        score
+      });
+    }
+  }
+  candidates.sort((x, y) => y.score - x.score);
+  const titles = [...document.querySelectorAll('h2, h3, [role=heading]')]
+    .map(e => (e.innerText || '').trim()).filter(Boolean).slice(0, 12);
+  return JSON.stringify({
+    found: candidates[0] || null,
+    count: candidates.length,
+    titles,
+    innerH: window.innerHeight,
+    innerW: window.innerWidth,
+    scrollY: window.scrollY,
+    maxY: Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
+  });
+})()""" % (json.dumps(HOST), json.dumps(KW_TOKENS))
+
+def smooth_scroll(dist, x, y):
+    cdp("Input.synthesizeScrollGesture", x=x, y=y, yDistance=-dist, speed=480, gestureSourceType="touch")
+    time.sleep(1.2)
+
 def is_target(url):
-    u=(url or "").lower(); return HOST in u and "bing." not in u and "chrome-error" not in u
+    u = (url or "").lower()
+    return HOST in u and "bing." not in u and "chrome-error" not in u
 
-success=False
-for attempt in range(40):
-    info=json.loads(js(FIND_JS) or "{}")
-    found=info.get("found"); H=info.get("innerH",800); W=info.get("innerW",400)
-    if found and 70<found["y"]<H-70:
-        print(f"found '{found['text']}' score={found.get('score')}",flush=True)
-        cdp("Input.synthesizeTapGesture",x=found["x"],y=found["y"])
-        print("real organic tap",flush=True)
-        for w in range(18):
+success = False
+for attempt in range(55):
+    info = json.loads(js(FIND_JS) or "{}")
+    found = info.get("found")
+    H = info.get("innerH", 800)
+    W = info.get("innerW", 400)
+    scrollY = info.get("scrollY", 0)
+    maxY = info.get("maxY", 0)
+
+    if attempt % 8 == 0:
+        print(f"  titles: {info.get('titles', [])[:6]}", flush=True)
+        print(f"  candidates: {info.get('count', 0)}", flush=True)
+
+    if found and 50 < found["y"] < H - 50:
+        print(f"found '{found['text']}' score={found.get('score')}", flush=True)
+        cdp("Input.synthesizeTapGesture", x=found["x"], y=found["y"])
+        print("real organic tap", flush=True)
+        for w in range(20):
             time.sleep(1.4)
             try:
-                now=(js("location.href") or "").lower()
-                if is_target(now): print("SUCCESS: organic landing",flush=True); success=True; break
-            except: pass
-            t=find_target_tab()
+                now = (js("location.href") or "").lower()
+                if is_target(now):
+                    print("SUCCESS: organic landing →", now[:90], flush=True)
+                    success = True
+                    break
+            except Exception:
+                pass
+            t = find_target_tab()
             if t:
-                try: ws.close()
-                except: pass
-                tab=t; ws=websocket.create_connection(tab["webSocketDebuggerUrl"],timeout=120,suppress_origin=True,ping_interval=12,ping_timeout=8)
-                cdp("Page.enable"); cdp("Runtime.enable"); cdp("Network.enable")
-                cdp("Network.setUserAgentOverride",userAgent=IPHONE_UA,platform="iPhone")
-                success=True; break
-        if success: break
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                tab = t
+                ws = websocket.create_connection(
+                    tab["webSocketDebuggerUrl"], timeout=120,
+                    suppress_origin=True, ping_interval=12, ping_timeout=8
+                )
+                cdp("Page.enable")
+                cdp("Runtime.enable")
+                cdp("Network.enable")
+                cdp("Network.setUserAgentOverride", userAgent=IPHONE_UA, platform="iPhone")
+                success = True
+                break
+        if success:
+            break
     else:
-        if found: smooth_scroll(int(found["y"]-H/2),int(W/2),int(H*0.55))
+        if found:
+            smooth_scroll(int(found["y"] - H / 2), int(W / 2), int(H * 0.55))
         else:
-            if info.get("scrollY",0)>=info.get("maxY",0)-10 and attempt>4: break
-            smooth_scroll(int(H*0.35),int(W/2),int(H*0.6))
-if not success: print("FAILED organic click",flush=True); sys.exit(1)
+            if scrollY >= maxY - 20 and attempt > 10:
+                print("Reached bottom of SERP – no matching result", flush=True)
+                break
+            smooth_scroll(int(H * 0.40), int(W / 2), int(H * 0.60))
 
-subprocess.run(["adb","exec-out","screencap","-p"],stdout=open(os.path.join(ARTIFACTS,"03-organic-landed.png"),"wb"),check=False)
+if not success:
+    print("FAILED organic click", flush=True)
+    try:
+        with open(os.path.join(ARTIFACTS, "page-debug.json"), "w") as f:
+            f.write(js(FIND_JS) or "{}")
+    except Exception:
+        pass
+    sys.exit(1)
+
+subprocess.run(["adb", "exec-out", "screencap", "-p"],
+               stdout=open(os.path.join(ARTIFACTS, "03-organic-landed.png"), "wb"), check=False)
 time.sleep(2)
-subprocess.run(["adb","exec-out","screencap","-p"],stdout=open(os.path.join(ARTIFACTS,"04-organic-settled.png"),"wb"),check=False)
+subprocess.run(["adb", "exec-out", "screencap", "-p"],
+               stdout=open(os.path.join(ARTIFACTS, "04-organic-settled.png"), "wb"), check=False)
 
-print("\n=== ENGAGEMENT ===",flush=True)
+# ---------- ENGAGEMENT ----------
+print("\n=== ENGAGEMENT ===", flush=True)
+
 def page_dims():
-    return json.loads(js("""(()=>JSON.stringify({H:window.innerHeight,W:window.innerWidth,scrollY:window.scrollY,maxY:Math.max(0,document.documentElement.scrollHeight-window.innerHeight)}))()""") or "{}")
-def smooth_scroll_random(sec):
-    end=time.time()+sec; count=0
-    while True:
-        remaining=end-time.time()
-        if remaining<=0.4: break
-        d=page_dims(); H,W=d.get("H",800),d.get("W",400); maxY,curY=d.get("maxY",0),d.get("scrollY",0)
-        direction=1 if (curY>=maxY-30 and maxY>0) else (-1 if curY<40 else (-1 if random.random()<0.75 else 1))
-        try:
-            cdp("Input.synthesizeScrollGesture",x=int(W*random.uniform(0.3,0.7)),y=int(H*random.uniform(0.4,0.7)),
-                yDistance=direction*random.randint(int(H*0.22),int(H*0.48)),speed=random.randint(220,420),gestureSourceType="touch")
-            count+=1
-        except Exception as e: print(f"scroll err: {e}",flush=True)
-        pause=random.uniform(2.2,5.0); remaining=end-time.time()
-        if remaining<=0: break
-        time.sleep(min(pause,remaining))
-    print(f"  {count} scrolls",flush=True)
-def find_good_links():
-    raw=js("""(()=>{const host=location.hostname.replace(/^www\\./,'').replace(/^m\\./,'');
-      const bad=['/about','/contact','/privacy','/terms','/licensing','/cookie'];
-      const vis=e=>{const r=e.getBoundingClientRect(),st=getComputedStyle(e);return r.width>12&&r.height>12&&st.visibility!=='hidden'&&st.display!=='none';};
-      const links=[...document.querySelectorAll('a[href]')].filter(a=>{try{const u=new URL(a.href,location.href);
-        if(u.hostname.replace(/^www\\./,'').replace(/^m\\./,'')!==host)return false;
-        if(bad.some(b=>u.pathname.toLowerCase().includes(b)))return false;
-        if(u.hash&&u.pathname===location.pathname)return false;return vis(a);}catch(e){return false;}});
-      const score=a=>{let s=0;const t=(a.innerText||'').trim().toLowerCase(),href=a.href.toLowerCase();
-        if(/\\/20[0-9]{2}\\//.test(href)||/\\/blog\\//.test(href))s+=8;
-        if(a.querySelector('h1,h2,h3,h4'))s+=5;if(t.length>25&&t.length<120)s+=3;return s;};
-      links.sort((x,y)=>score(y)-score(x));
-      return JSON.stringify(links.slice(0,18).map(a=>{const t=a.querySelector('h1,h2,h3,h4')||a;const r=t.getBoundingClientRect();
-        return {text:(t.innerText||'').trim().slice(0,80),href:a.href,x:r.left+r.width/2,y:r.top+r.height/2,score:score(a)};}));})()""")
-    try: return json.loads(raw or "[]")
-    except: return []
+    return json.loads(js("""(() => JSON.stringify({
+        H: window.innerHeight, W: window.innerWidth,
+        scrollY: window.scrollY,
+        maxY: Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
+    }))()""") or "{}")
 
-visited=set(); current=js("location.href") or ""
-print("starting on:",current,flush=True)
-for page_num in range(1,NUM_PAGES+1):
-    print(f"\n===== PAGE {page_num}/{NUM_PAGES} =====",flush=True)
-    dwell=random.randint(MIN_DWELL,MAX_DWELL); print(f"  dwell ~{dwell}s",flush=True)
+def smooth_scroll_random(sec):
+    end = time.time() + sec
+    count = 0
+    while True:
+        remaining = end - time.time()
+        if remaining <= 0.4:
+            break
+        d = page_dims()
+        H, W = d.get("H", 800), d.get("W", 400)
+        maxY, curY = d.get("maxY", 0), d.get("scrollY", 0)
+        if curY >= maxY - 30 and maxY > 0:
+            direction = 1
+        elif curY < 40:
+            direction = -1
+        else:
+            direction = -1 if random.random() < 0.75 else 1
+        try:
+            cdp("Input.synthesizeScrollGesture",
+                x=int(W * random.uniform(0.3, 0.7)),
+                y=int(H * random.uniform(0.4, 0.7)),
+                yDistance=direction * random.randint(int(H * 0.22), int(H * 0.48)),
+                speed=random.randint(220, 420),
+                gestureSourceType="touch")
+            count += 1
+        except Exception as e:
+            print(f"scroll err: {e}", flush=True)
+        pause = random.uniform(2.2, 5.0)
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(pause, remaining))
+    print(f"  {count} scrolls", flush=True)
+
+def find_good_links():
+    raw = js("""(() => {
+        const host = location.hostname.replace(/^www\\./,'').replace(/^m\\./,'');
+        const bad = ['/about','/contact','/privacy','/terms','/licensing','/cookie'];
+        const vis = e => {
+            const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+            return r.width > 12 && r.height > 12 && st.visibility !== 'hidden' && st.display !== 'none';
+        };
+        const links = [...document.querySelectorAll('a[href]')].filter(a => {
+            try {
+                const u = new URL(a.href, location.href);
+                if (u.hostname.replace(/^www\\./,'').replace(/^m\\./,'') !== host) return false;
+                if (bad.some(b => u.pathname.toLowerCase().includes(b))) return false;
+                if (u.hash && u.pathname === location.pathname) return false;
+                return vis(a);
+            } catch(e) { return false; }
+        });
+        const score = a => {
+            let s = 0;
+            const t = (a.innerText || '').trim().toLowerCase(), href = a.href.toLowerCase();
+            if (/\\/20[0-9]{2}\\//.test(href) || /\\/blog\\//.test(href)) s += 8;
+            if (a.querySelector('h1,h2,h3,h4')) s += 5;
+            if (t.length > 25 && t.length < 120) s += 3;
+            return s;
+        };
+        links.sort((x, y) => score(y) - score(x));
+        return JSON.stringify(links.slice(0, 18).map(a => {
+            const t = a.querySelector('h1,h2,h3,h4') || a;
+            const r = t.getBoundingClientRect();
+            return {text: (t.innerText||'').trim().slice(0,80), href: a.href,
+                    x: r.left+r.width/2, y: r.top+r.height/2, score: score(a)};
+        }));
+    })()""")
+    try:
+        return json.loads(raw or "[]")
+    except Exception:
+        return []
+
+visited = set()
+current = js("location.href") or ""
+print("starting on:", current, flush=True)
+
+for page_num in range(1, NUM_PAGES + 1):
+    print(f"\n===== PAGE {page_num}/{NUM_PAGES} =====", flush=True)
+    dwell = random.randint(MIN_DWELL, MAX_DWELL)
+    print(f"  dwell ~{dwell}s", flush=True)
     smooth_scroll_random(dwell)
     try:
-        name=f"0{4+page_num}-page{page_num}.png"
-        subprocess.run(["adb","exec-out","screencap","-p"],stdout=open(os.path.join(ARTIFACTS,name),"wb"),check=False)
-    except: pass
-    if page_num>=NUM_PAGES: break
-    links=find_good_links()
-    candidates=[L for L in links if L["href"] not in visited and L.get("score",0)>=3] or [L for L in links if L["href"] not in visited]
-    if not candidates: print("  no more links",flush=True); break
-    choice=random.choice(sorted(candidates,key=lambda x:x.get("score",0),reverse=True)[:6])
-    visited.add(choice["href"]); print(f"  tap '{choice['text'][:50]}'",flush=True)
-    old=(js("location.href") or "").rstrip("/")
-    cdp("Input.synthesizeTapGesture",x=choice["x"],y=choice["y"]); time.sleep(random.uniform(5.5, 8.0))
-    new=(js("location.href") or "").rstrip("/")
-    if new==old and choice["href"] not in new:
-        cdp("Page.navigate",url=choice["href"]); time.sleep(3.5)
-    print("  now:",js("location.href"),flush=True)
-print("\n===== FINAL =====",flush=True)
-smooth_scroll_random(random.randint(40,70))
-subprocess.run(["adb","exec-out","screencap","-p"],stdout=open(os.path.join(ARTIFACTS,"09-final.png"),"wb"),check=False)
-print("visited:",list(visited),flush=True); ws.close()
-print("DONE – Bing iPhone organic + engagement finished",flush=True)
+        name = f"0{4 + page_num}-page{page_num}.png"
+        subprocess.run(["adb", "exec-out", "screencap", "-p"],
+                       stdout=open(os.path.join(ARTIFACTS, name), "wb"), check=False)
+    except Exception:
+        pass
+    if page_num >= NUM_PAGES:
+        break
+    links = find_good_links()
+    candidates = [L for L in links if L["href"] not in visited and L.get("score", 0) >= 3] \
+                 or [L for L in links if L["href"] not in visited]
+    if not candidates:
+        print("  no more links", flush=True)
+        break
+    choice = random.choice(sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:6])
+    visited.add(choice["href"])
+    print(f"  tap '{choice['text'][:50]}'", flush=True)
+    old = (js("location.href") or "").rstrip("/")
+    cdp("Input.synthesizeTapGesture", x=choice["x"], y=choice["y"])
+    time.sleep(random.uniform(5.5, 8.0))
+    new = (js("location.href") or "").rstrip("/")
+    if new == old and choice["href"] not in new:
+        cdp("Page.navigate", url=choice["href"])
+        time.sleep(3.5)
+    print("  now:", js("location.href"), flush=True)
+
+print("\n===== FINAL =====", flush=True)
+smooth_scroll_random(random.randint(40, 70))
+subprocess.run(["adb", "exec-out", "screencap", "-p"],
+               stdout=open(os.path.join(ARTIFACTS, "09-final.png"), "wb"), check=False)
+print("visited:", list(visited), flush=True)
+ws.close()
+print("DONE – Bing iPhone organic + engagement finished", flush=True)
 PY
 }
 
@@ -416,10 +580,8 @@ log "waiting for first boot"
 wait_for_boot
 if ensure_root; then HAVE_ROOT=1; fi
 settle_device
-
 pick_iphone_profile
 dump_identity
-
 resolve_chrome
 skip_chrome_welcome
 
@@ -454,5 +616,6 @@ else
   screenshot "03-failed.png"
   exit 1
 fi
+
 log "done"
 ls -la "$ARTIFACTS"
