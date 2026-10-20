@@ -7,14 +7,41 @@ ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 ARTIFACTS="${ROOT}/artifacts"
 mkdir -p "$ARTIFACTS"
 
+
+
+
 CHROME_PKG="com.android.chrome"
-TARGET_URL="https://search.yahoo.com"
-SEARCH_URL="https://search.yahoo.com/search?p=slugs+vs+birds+vs+mice"
-RESULT_HOST="gardengar.com"
-RESULT_TEXT="strawberries"
 HAVE_ROOT=0
 
 log() { printf '[capture] %s\n' "$*"; }
+
+
+# ---- keywords / domain from GitHub Actions inputs (env) ----
+RESULT_HOST="${TARGET_DOMAIN:-gardengar.com}"
+RESULT_HOST="${RESULT_HOST#www.}"
+RESULT_HOST="${RESULT_HOST#https://}"
+RESULT_HOST="${RESULT_HOST#http://}"
+RESULT_HOST="${RESULT_HOST%%/*}"
+
+RAW_KEYWORDS="${SEARCH_KEYWORDS:-gardengar.com}"
+KEYWORDS_FILE="$(mktemp)"
+printf '%s\n' "$RAW_KEYWORDS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' > "$KEYWORDS_FILE" || true
+if [[ ! -s "$KEYWORDS_FILE" ]]; then
+  echo "gardengar.com" > "$KEYWORDS_FILE"
+fi
+mapfile -t KW_ARR < "$KEYWORDS_FILE"
+rm -f "$KEYWORDS_FILE"
+PICKED_KEYWORD="${KW_ARR[RANDOM % ${#KW_ARR[@]}]}"
+log "Target domain: $RESULT_HOST"
+log "Keyword pool (${#KW_ARR[@]}): ${KW_ARR[*]}"
+log "Picked keyword for this run: $PICKED_KEYWORD"
+
+ENCODED_KEYWORD="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$PICKED_KEYWORD")"
+
+SEARCH_URL="https://search.yahoo.com/search?p=${ENCODED_KEYWORD}"
+TARGET_URL="https://www.yahoo.com"
+RESULT_TEXT="$PICKED_KEYWORD"
+export RESULT_HOST RESULT_TEXT SEARCH_URL TARGET_URL
 adb_sh() { adb shell "$@" | tr -d '\r'; }
 
 wait_for_boot() {
@@ -160,15 +187,21 @@ wait_for_devtools() {
   while (( i < max )); do
     if curl -s --max-time 3 http://127.0.0.1:9222/json >/dev/null 2>&1; then
       local count
-      count=$(curl -s --max-time 3 http://127.0.0.1:9222/json 2>/dev/null | python3 -c "import sys,json; print(len([t for t in json.load(sys.stdin) if t.get('type')=='page']))" 2>/dev/null || echo 0)
-      [[ "$count" -gt 0 ]] && { log "DevTools ready (${count} tab(s))"; return 0; }
+      count=$(curl -s --max-time 3 http://127.0.0.1:9222/json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len([t for t in d if t.get('type')=='page']))" 2>/dev/null || echo 0)
+      if [[ "$count" -gt 0 ]]; then
+        log "DevTools ready (${count} tab(s))"
+        return 0
+      fi
     fi
-    sleep 1.5; i=$((i+1))
-    if (( i % 6 == 0 )); then
+    sleep 1.5
+    i=$((i+1))
+    if (( i % 5 == 0 )); then
+      log "DevTools not ready yet (attempt $i/$max) – re-forwarding"
       adb forward --remove tcp:9222 >/dev/null 2>&1 || true
       adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
     fi
   done
+  log "DevTools wait timed out after ${max} attempts"
   return 1
 }
 
@@ -400,7 +433,17 @@ fi
 resolve_chrome; skip_chrome_welcome
 open_url "$TARGET_URL"; sleep 6; dismiss_chrome_sheets; screenshot "01-yahoo-home.png"
 open_url "$SEARCH_URL"; sleep 9; dismiss_chrome_sheets; screenshot "02-search-results.png"
-wait_for_devtools 25 || true
+if ! wait_for_devtools 30; then
+  log "DevTools not ready – restart Chrome and retry search page"
+  open_url "$SEARCH_URL"
+  sleep 12
+  dismiss_chrome_sheets
+  if ! wait_for_devtools 35; then
+    log "DevTools still not reachable – aborting"
+    screenshot "03-failed.png"
+    exit 1
+  fi
+fi
 
 log "Starting Yahoo organic traffic as $MARKETNAME"
 if do_organic_and_engage; then
