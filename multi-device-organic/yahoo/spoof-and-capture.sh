@@ -253,6 +253,7 @@ try_keyword() {
   RESULT_TEXT="$keyword" \
   RESULT_HOST="$RESULT_HOST" \
   ARTIFACTS="$ARTIFACTS" \
+  SERP_URL="$search_url" \
   python3 - <<'PY'
 import json, os, sys, time, random, urllib.request, subprocess
 import websocket
@@ -268,7 +269,19 @@ def get_tabs():
 def find_serp_tab():
     try:
         pages = [t for t in get_tabs() if t.get("type") == "page"]
-        pages.sort(key=lambda t: 0 if "yahoo." in t.get("url", "").lower() else 1)
+        def rank(t):
+            u = (t.get("url") or "").lower()
+            # Prefer real SERP, avoid bot/beacon/_bv error pages
+            if "/_bv/" in u or "v.gif" in u:
+                return 90
+            if "chrome-error" in u or u.startswith("chrome://"):
+                return 95
+            if "search.yahoo.com/search" in u or ("yahoo." in u and "search" in u and "p=" in u):
+                return 0
+            if "yahoo." in u:
+                return 20
+            return 50
+        pages.sort(key=rank)
         return pages[0] if pages else None
     except Exception:
         return None
@@ -333,7 +346,75 @@ def js(expr):
     return r.get("result", {}).get("value")
 
 cdp("Page.enable"); cdp("Runtime.enable"); cdp("Network.enable")
+
+# Yahoo often sends GitHub runner IPs to /_bv bot beacon (HTTP 500).
+SERP_GOAL = os.environ.get("SERP_URL", "")
+
+def on_bad_yahoo_page(url):
+    u = (url or "").lower()
+    return ("/_bv/" in u) or ("v.gif" in u) or ("chrome-error" in u)
+
+cur0 = (js("location.href") or "").lower()
+print("initial href:", cur0[:160], flush=True)
+if on_bad_yahoo_page(cur0) or (SERP_GOAL and "search?p=" not in cur0):
+    print("bad Yahoo page – force navigate to real SERP", flush=True)
+    if SERP_GOAL:
+        try:
+            cdp("Page.navigate", url=SERP_GOAL)
+            time.sleep(7)
+        except Exception as e:
+            print("navigate failed:", e, flush=True)
+    for _ in range(14):
+        time.sleep(1.2)
+        nt = find_serp_tab()
+        if not nt:
+            continue
+        nu = (nt.get("url") or "").lower()
+        if on_bad_yahoo_page(nu):
+            if SERP_GOAL and _ == 6:
+                try:
+                    cdp("Page.navigate", url=SERP_GOAL)
+                    time.sleep(5)
+                except Exception:
+                    pass
+            continue
+        try:
+            ws.close()
+        except Exception:
+            pass
+        tab = nt
+        ws = websocket.create_connection(
+            tab["webSocketDebuggerUrl"], timeout=120, suppress_origin=True,
+            ping_interval=12, ping_timeout=8
+        )
+        cdp("Page.enable"); cdp("Runtime.enable"); cdp("Network.enable")
+        print("re-attached:", tab.get("url"), flush=True)
+        break
+
+# Wait for real content
+for wait_i in range(18):
+    try:
+        href_now = (js("location.href") or "").lower()
+        body_txt = js("document.body && document.body.innerText ? document.body.innerText : ''") or ""
+        body_len = len(body_txt)
+        if on_bad_yahoo_page(href_now) or "isn't working" in body_txt.lower() or "http error" in body_txt.lower():
+            if SERP_GOAL and wait_i in (4, 10):
+                print("still blocked – reload SERP", flush=True)
+                cdp("Page.navigate", url=SERP_GOAL)
+                time.sleep(5)
+            time.sleep(1.2)
+            continue
+        if body_len > 500 and ("result" in body_txt.lower() or "http" in body_txt.lower() or HOST in body_txt.lower() or len(body_txt) > 1200):
+            print(f"SERP content ready (body~{body_len})", flush=True)
+            break
+    except Exception as e:
+        print("wait err:", e, flush=True)
+    time.sleep(1.2)
+else:
+    print("SERP still empty/blocked after wait – will try FIND anyway", flush=True)
+
 print(f"domain={HOST}  keyword={TARGET}", flush=True)
+print("current:", (js("location.href") or "")[:160], flush=True)
 
 KW_TOKENS = [w for w in TARGET.replace("-", " ").split() if len(w) > 2][:8]
 
@@ -414,6 +495,7 @@ def is_target(url):
 print("=== SERP page 1 only ===", flush=True)
 success = False
 stale_bottom = 0
+empty_streak = 0
 for attempt in range(35):
     try:
         cur = (js("location.href") or "").lower()
@@ -435,6 +517,23 @@ for attempt in range(35):
         print(f"  candidates={info.get('count',0)} scroll={scrollY:.0f}/{maxY:.0f}", flush=True)
         if info.get("titles"):
             print(f"  titles: {info.get('titles')[:4]}", flush=True)
+    if not found and maxY == 0 and info.get("count", 0) == 0:
+        empty_streak += 1
+        if empty_streak >= 4:
+            # likely still on bot/500 page
+            href_chk = (js("location.href") or "").lower()
+            print(f"empty SERP streak – href={href_chk[:120]}", flush=True)
+            if SERP_GOAL and empty_streak == 4:
+                try:
+                    cdp("Page.navigate", url=SERP_GOAL)
+                    time.sleep(6)
+                except Exception:
+                    pass
+            if empty_streak >= 8:
+                print("Yahoo SERP blocked/empty – KEYWORD_MISS", flush=True)
+                break
+    else:
+        empty_streak = 0
 
     if found and 40 < found["y"] < H - 40:
         print(f"found '{found['text']}' score={found.get('score')}", flush=True)
