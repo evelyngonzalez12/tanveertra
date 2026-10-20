@@ -24,7 +24,7 @@ on:
         default: "gardengar.com"
         type: string
       keywords:
-        description: "Keywords (one per line or comma-separated). Each run picks one at random."
+        description: "Keywords (one per line or comma-separated). Tries each on page 1 until domain is found."
         required: true
         default: "gardengar.com"
         type: string
