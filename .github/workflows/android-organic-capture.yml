@@ -3,18 +3,13 @@ name: Android Organic Capture (multi-device)
 on:
   workflow_dispatch:
     inputs:
-      chain_index:
-        description: "Start from run number (usually leave 1)"
-        required: false
-        default: "1"
-        type: string
       max_runs:
-        description: "How many total runs (1–100). Example: 50"
-        required: false
+        description: "How many traffic runs (1–100)"
+        required: true
         default: "20"
         type: string
       search_engine:
-        description: "Which search engine"
+        description: "Search engine"
         required: true
         default: "google"
         type: choice
@@ -23,6 +18,21 @@ on:
           - bing
           - yahoo
           - duckduckgo
+      target_domain:
+        description: "Target domain to click (e.g. gardengar.com)"
+        required: true
+        default: "gardengar.com"
+        type: string
+      keywords:
+        description: "Keywords (one per line or comma-separated). Tries each on page 1 until domain is found."
+        required: true
+        default: "gardengar.com"
+        type: string
+      chain_index:
+        description: "Leave as 1 (auto-chaining)"
+        required: false
+        default: "1"
+        type: string
 
 permissions:
   contents: read
@@ -75,23 +85,17 @@ jobs:
         run: |
           ENG="${{ steps.chain.outputs.engine }}"
           mkdir -p scripts/emulator
-
           if [ -f "multi-device-organic/${ENG}/spoof-and-capture.sh" ]; then
             cp "multi-device-organic/${ENG}/spoof-and-capture.sh" scripts/emulator/spoof-and-capture.sh
             echo "Using multi-device-organic/${ENG}/spoof-and-capture.sh"
-          elif [ -f "scripts/emulator/spoof-and-capture.sh" ]; then
-            echo "Using existing scripts/emulator/spoof-and-capture.sh"
           else
-            echo "ERROR: No script found for engine $ENG"
-            echo "Expected: multi-device-organic/${ENG}/spoof-and-capture.sh"
+            echo "ERROR: multi-device-organic/${ENG}/spoof-and-capture.sh missing"
             exit 1
           fi
-
           if [ ! -f "scripts/emulator/patch-avd.sh" ]; then
-            echo "ERROR: scripts/emulator/patch-avd.sh is missing"
+            echo "ERROR: scripts/emulator/patch-avd.sh missing"
             exit 1
           fi
-
           chmod +x scripts/emulator/*.sh
           ls -la scripts/emulator/
 
@@ -99,6 +103,8 @@ jobs:
         uses: reactivecircus/android-emulator-runner@v2
         env:
           AVD_NAME: samsung-s24u
+          TARGET_DOMAIN: ${{ github.event.inputs.target_domain }}
+          SEARCH_KEYWORDS: ${{ github.event.inputs.keywords }}
         with:
           api-level: 34
           target: google_apis
@@ -134,7 +140,7 @@ jobs:
           retention-days: 7
 
       - name: Dispatch next run
-        if: success() && steps.chain.outputs.index < steps.chain.outputs.max
+        if: success() && fromJSON(steps.chain.outputs.index) < fromJSON(steps.chain.outputs.max)
         uses: actions/github-script@v7
         with:
           script: |
@@ -150,6 +156,8 @@ jobs:
               inputs: {
                 chain_index: next,
                 max_runs: max,
-                search_engine: eng
+                search_engine: eng,
+                target_domain: '${{ github.event.inputs.target_domain }}',
+                keywords: `${{ github.event.inputs.keywords }}`
               }
             });
