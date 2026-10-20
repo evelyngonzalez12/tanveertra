@@ -198,6 +198,19 @@ settle_device() {
   adb_sh wm density 420 || true
 }
 
+
+install_websocket() {
+  log "Installing websocket-client..."
+  python3 -m pip install -q websocket-client --break-system-packages >/dev/null 2>&1 \
+    || python3 -m pip install -q websocket-client >/dev/null 2>&1 || true
+  if python3 -c "import websocket" 2>/dev/null; then
+    log "websocket-client OK"
+    return 0
+  fi
+  log "ERROR: websocket module still missing"
+  return 1
+}
+
 # Try one keyword: open SERP page 1 only, find domain, tap. Returns 0 on success.
 try_keyword() {
   local keyword="$1"
@@ -605,6 +618,12 @@ open_url "$TARGET_URL"
 sleep 6
 dismiss_chrome_sheets
 screenshot "01-bing-home.png"
+
+install_websocket || {
+  log "Cannot install websocket-client – aborting"
+  screenshot "03-failed.png"
+  exit 1
+}
 
 # Try each keyword on page 1 until one lands on domain
 HIT=0
