@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
-# Yahoo organic traffic – randomly rotates multiple Android devices
-# Keyword: gardengar.com (or change SEARCH_URL / RESULT_TEXT as needed)
+# Yahoo organic – Android multi-device
+# Tries keywords one-by-one on SERP page 1 only until domain is found.
 set -euo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 ARTIFACTS="${ROOT}/artifacts"
 mkdir -p "$ARTIFACTS"
 
-
-
-
 CHROME_PKG="com.android.chrome"
 HAVE_ROOT=0
+BRAND=""; MODEL=""; NAME=""; DEVICE=""; MARKETNAME=""; FINGERPRINT=""; SDK="14"; DENSITY="420"
 
 log() { printf '[capture] %s\n' "$*"; }
+adb_sh() { adb shell "$@" | tr -d '\r'; }
 
-
-# ---- keywords / domain from GitHub Actions inputs (env) ----
+# ---- domain + keyword pool from GitHub Actions ----
 RESULT_HOST="${TARGET_DOMAIN:-gardengar.com}"
 RESULT_HOST="${RESULT_HOST#www.}"
 RESULT_HOST="${RESULT_HOST#https://}"
@@ -31,18 +29,16 @@ if [[ ! -s "$KEYWORDS_FILE" ]]; then
 fi
 mapfile -t KW_ARR < "$KEYWORDS_FILE"
 rm -f "$KEYWORDS_FILE"
-PICKED_KEYWORD="${KW_ARR[RANDOM % ${#KW_ARR[@]}]}"
+
+if ((${#KW_ARR[@]} > 1)); then
+  mapfile -t KW_ARR < <(printf '%s\n' "${KW_ARR[@]}" | shuf)
+fi
+
 log "Target domain: $RESULT_HOST"
 log "Keyword pool (${#KW_ARR[@]}): ${KW_ARR[*]}"
-log "Picked keyword for this run: $PICKED_KEYWORD"
 
-ENCODED_KEYWORD="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$PICKED_KEYWORD")"
-
-SEARCH_URL="https://search.yahoo.com/search?p=${ENCODED_KEYWORD}"
 TARGET_URL="https://www.yahoo.com"
-RESULT_TEXT="$PICKED_KEYWORD"
-export RESULT_HOST RESULT_TEXT SEARCH_URL TARGET_URL
-adb_sh() { adb shell "$@" | tr -d '\r'; }
+export RESULT_HOST TARGET_URL
 
 wait_for_boot() {
   adb wait-for-device
@@ -67,7 +63,6 @@ ensure_root() {
   log "no root"; return 1
 }
 
-# ---------- Random Android device profiles ----------
 pick_android_device() {
   local devices=(
     "samsung|SM-S928B|e3sxxx|e3s|Galaxy S24 Ultra|samsung/e3sxxx/e3s:14/UP1A.231005.007/S928BXXS3AXKF:user/release-keys|14|420"
@@ -121,6 +116,8 @@ dump_identity() {
     done
     echo; echo "=== selected profile ==="
     echo "marketname=$MARKETNAME model=$MODEL brand=$BRAND sdk=$SDK"
+    echo "domain=$RESULT_HOST"
+    echo "keywords=${KW_ARR[*]}"
   } | tee "$ARTIFACTS/identity.txt"
 }
 
@@ -220,194 +217,409 @@ settle_device() {
   adb_sh wm density "${DENSITY:-420}" || true
 }
 
-do_organic_and_engage() {
-  python3 -m pip install -q websocket-client --break-system-packages >/dev/null 2>&1 || python3 -m pip install -q websocket-client >/dev/null 2>&1 || true
-  adb forward --remove tcp:9222 >/dev/null 2>&1 || true
-  adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
+install_websocket() {
+  log "Installing websocket-client..."
+  python3 -m pip install -q websocket-client --break-system-packages >/dev/null 2>&1 \
+    || python3 -m pip install -q websocket-client >/dev/null 2>&1 || true
+  if python3 -c "import websocket" 2>/dev/null; then
+    log "websocket-client OK"
+    return 0
+  fi
+  log "ERROR: websocket module still missing"
+  return 1
+}
 
-  RESULT_HOST="$RESULT_HOST" RESULT_TEXT="$RESULT_TEXT" ARTIFACTS="$ARTIFACTS" python3 - <<'PY'
-import json,os,sys,time,random,urllib.request,subprocess
+# Try one keyword: SERP page 1 only. Returns 0 on success.
+try_keyword() {
+  local keyword="$1"
+  local encoded
+  encoded="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$keyword")"
+  local search_url="https://search.yahoo.com/search?p=${encoded}"
+
+  log "Trying keyword: $keyword"
+  open_url "$search_url"
+  sleep 8
+  dismiss_chrome_sheets
+  screenshot "02-search-$(echo "$keyword" | tr ' /' '__' | cut -c1-40).png"
+
+  if ! wait_for_devtools 25; then
+    log "DevTools not ready for keyword – retry open"
+    open_url "$search_url"
+    sleep 10
+    dismiss_chrome_sheets
+    wait_for_devtools 30 || { log "DevTools failed for this keyword"; return 1; }
+  fi
+
+  RESULT_TEXT="$keyword" \
+  RESULT_HOST="$RESULT_HOST" \
+  ARTIFACTS="$ARTIFACTS" \
+  python3 - <<'PY'
+import json, os, sys, time, random, urllib.request, subprocess
 import websocket
-HOST=os.environ["RESULT_HOST"].strip().lower()
-TARGET=os.environ["RESULT_TEXT"].strip().lower()
-ARTIFACTS=os.environ["ARTIFACTS"]
-NUM_PAGES=random.randint(4,6)
-MIN_DWELL,MAX_DWELL=55,110
+
+HOST = os.environ["RESULT_HOST"].strip().lower()
+TARGET = os.environ["RESULT_TEXT"].strip().lower()
+ARTIFACTS = os.environ["ARTIFACTS"]
 
 def get_tabs():
-    with urllib.request.urlopen("http://127.0.0.1:9222/json",timeout=8) as r: return json.loads(r.read().decode())
+    with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=8) as r:
+        return json.loads(r.read().decode())
+
 def find_serp_tab():
     try:
-        pages=[t for t in get_tabs() if t.get("type")=="page"]
-        pages.sort(key=lambda t:0 if "yahoo." in t.get("url","").lower() else 1)
+        pages = [t for t in get_tabs() if t.get("type") == "page"]
+        pages.sort(key=lambda t: 0 if "yahoo." in t.get("url", "").lower() else 1)
         return pages[0] if pages else None
-    except: return None
+    except Exception:
+        return None
+
 def find_target_tab():
     try:
         for t in get_tabs():
-            if t.get("type")!="page": continue
-            u=t.get("url","").lower()
-            if HOST in u and "yahoo." not in u and "chrome-error" not in u: return t
-    except: pass
+            if t.get("type") != "page":
+                continue
+            u = t.get("url", "").lower()
+            if HOST in u and "yahoo." not in u and "chrome-error" not in u:
+                return t
+    except Exception:
+        pass
     return None
 
-tab=None
-for _ in range(40):
-    tab=find_serp_tab()
-    if tab: break
+tab = None
+for attempt in range(30):
+    tab = find_serp_tab()
+    if tab:
+        break
     time.sleep(1.2)
 if not tab:
-    print("DevTools tab not reachable",flush=True); sys.exit(2)
-print("attached to:",tab.get("url"),flush=True)
+    print("NO_TAB", flush=True)
+    sys.exit(1)
 
-ws=websocket.create_connection(tab["webSocketDebuggerUrl"],timeout=120,suppress_origin=True,ping_interval=12,ping_timeout=8)
-_id=0
-def cdp(method,**params):
-    global _id,ws,tab
+print("attached:", tab.get("url"), flush=True)
+ws = websocket.create_connection(
+    tab["webSocketDebuggerUrl"], timeout=120, suppress_origin=True,
+    ping_interval=12, ping_timeout=8
+)
+_id = 0
+
+def cdp(method, **params):
+    global _id, ws, tab
     for attempt in range(4):
         try:
-            _id+=1
-            ws.send(json.dumps({"id":_id,"method":method,"params":params}))
-            deadline=time.time()+25
-            while time.time()<deadline:
-                msg=json.loads(ws.recv())
-                if msg.get("id")==_id: return msg.get("result",{})
+            _id += 1
+            ws.send(json.dumps({"id": _id, "method": method, "params": params}))
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                msg = json.loads(ws.recv())
+                if msg.get("id") == _id:
+                    return msg.get("result", {})
         except Exception as e:
-            print(f"CDP error ({attempt+1}): {e}",flush=True)
+            print(f"CDP err ({attempt+1}): {e}", flush=True)
             try: ws.close()
-            except: pass
+            except Exception: pass
             time.sleep(2)
-            new=find_target_tab() or find_serp_tab()
-            if not new: raise
-            tab=new
-            ws=websocket.create_connection(tab["webSocketDebuggerUrl"],timeout=120,suppress_origin=True,ping_interval=12,ping_timeout=8)
+            new = find_target_tab() or find_serp_tab()
+            if not new:
+                raise
+            tab = new
+            ws = websocket.create_connection(
+                tab["webSocketDebuggerUrl"], timeout=120, suppress_origin=True,
+                ping_interval=12, ping_timeout=8
+            )
     raise RuntimeError("CDP failed")
+
 def js(expr):
-    r=cdp("Runtime.evaluate",expression=expr,returnByValue=True)
-    return r.get("result",{}).get("value")
+    r = cdp("Runtime.evaluate", expression=expr, returnByValue=True)
+    return r.get("result", {}).get("value")
 
 cdp("Page.enable"); cdp("Runtime.enable"); cdp("Network.enable")
+print(f"domain={HOST}  keyword={TARGET}", flush=True)
 
-print("=== YAHOO ORGANIC CLICK ===",flush=True)
-FIND_JS="""(() => {
-  const HOST=%s, TEXT=%s;
-  const vis=e=>{const r=e.getBoundingClientRect(),st=getComputedStyle(e);return r.width>4&&r.height>4&&st.visibility!=='hidden'&&st.display!=='none';};
-  const points=a=>{try{const h=decodeURIComponent(a.href||'').toLowerCase();
-    if(h.includes(HOST))return true;
-    const t=((a.innerText||'')+' '+(a.textContent||'')).toLowerCase();
-    return t.includes(HOST)||(t.includes(TEXT)&&t.length<90);}catch(e){return false;}};
-  const links=[...document.querySelectorAll('a[href]')].filter(a=>points(a)&&vis(a));
-  const score=a=>{let s=0;const t=(a.innerText||'').trim().toLowerCase();
-    if(a.querySelector('h3,[role=heading]'))s+=8;
-    if(t.includes(HOST)||t.includes(TEXT))s+=5;
-    if((a.href||'').includes(HOST))s+=4;return s;};
-  links.sort((x,y)=>score(y)-score(x));
-  let best=null;
-  if(links.length){const a=links[0];const t=a.querySelector('h3,[role=heading]')||a;const r=t.getBoundingClientRect();
-    best={tag:t.tagName,text:(t.innerText||'').trim().slice(0,100),href:a.href,x:r.left+r.width/2,y:r.top+r.height/2,score:score(a)};}
-  return JSON.stringify({found:best,innerH:window.innerHeight,innerW:window.innerWidth,scrollY:window.scrollY,maxY:document.documentElement.scrollHeight-window.innerHeight});
-})()"""%(json.dumps(HOST),json.dumps(TARGET))
+KW_TOKENS = [w for w in TARGET.replace("-", " ").split() if len(w) > 2][:8]
 
-def smooth_scroll(dist,x,y):
-    cdp("Input.synthesizeScrollGesture",x=x,y=y,yDistance=-dist,speed=480,gestureSourceType="touch"); time.sleep(1.1)
+FIND_JS = """(() => {
+  const HOST = %s;
+  const TOKENS = %s;
+  const vis = e => {
+    const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+    return r.width > 6 && r.height > 6 && st.visibility !== 'hidden' && st.display !== 'none';
+  };
+  const cards = [...document.querySelectorAll(
+    'div.dd.algo, div.algo, li div.dd, .rel, section.main ol > li, #web ol > li, .searchCenterMiddle li, .compTitle, ol > li'
+  )];
+  const extra = [...document.querySelectorAll('li, div, section, article')].filter(el => {
+    const t = (el.innerText || '').toLowerCase();
+    return t.includes(HOST) || t.includes('gardengar');
+  });
+  const blocks = cards.length ? cards : extra;
+  const candidates = [];
+  const seen = new Set();
+  for (const card of blocks) {
+    const text = (card.innerText || '').toLowerCase();
+    if (!text.includes(HOST) && !text.includes('gardengar')) continue;
+    let a = [...card.querySelectorAll('a[href]')].find(x => {
+      const h = decodeURIComponent(x.href || '').toLowerCase();
+      return (h.includes(HOST) || h.includes('gardengar')) && !h.includes('yahoo.com');
+    });
+    if (!a) a = card.querySelector('h3 a, h2 a, a.s-title, .compTitle a, a');
+    if (!a || !vis(a)) continue;
+    const hrefRaw = a.href || '';
+    const href = decodeURIComponent(hrefRaw).toLowerCase();
+    if (href.includes('search.yahoo') || href.includes('yahoo.com/search')) continue;
+    if (seen.has(hrefRaw)) continue;
+    seen.add(hrefRaw);
+    let score = 0;
+    if (text.includes(HOST) || text.includes('gardengar')) score += 25;
+    if (href.includes(HOST) || href.includes('gardengar')) score += 20;
+    if (a.querySelector('h2, h3') || a.closest('h2, h3, .compTitle')) score += 8;
+    for (const t of TOKENS) {
+      if (text.includes(t)) score += 2;
+    }
+    if (score < 20) continue;
+    const titleEl = card.querySelector('h3, h2, .compTitle, [role=heading]') || a;
+    const r = titleEl.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) continue;
+    candidates.push({
+      tag: titleEl.tagName,
+      text: (titleEl.innerText || a.innerText || '').trim().slice(0, 120),
+      href: a.href,
+      x: r.left + r.width / 2,
+      y: r.top + r.height / 2,
+      score
+    });
+  }
+  candidates.sort((x, y) => y.score - x.score);
+  const titles = [...document.querySelectorAll('h3, h2, .compTitle, cite')]
+    .map(e => (e.innerText || '').trim()).filter(Boolean).slice(0, 12);
+  return JSON.stringify({
+    found: candidates[0] || null,
+    count: candidates.length,
+    titles,
+    innerH: window.innerHeight,
+    innerW: window.innerWidth,
+    scrollY: window.scrollY,
+    maxY: Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
+  });
+})()""" % (json.dumps(HOST), json.dumps(KW_TOKENS))
+
+def smooth_scroll(dist, x, y):
+    cdp("Input.synthesizeScrollGesture", x=x, y=y, yDistance=-dist,
+        speed=450, gestureSourceType="touch")
+    time.sleep(1.1)
+
 def is_target(url):
-    u=(url or "").lower(); return HOST in u and "yahoo." not in u and "chrome-error" not in u
+    u = (url or "").lower()
+    return HOST in u and "yahoo." not in u and "chrome-error" not in u
 
-success=False
-for attempt in range(40):
-    info=json.loads(js(FIND_JS) or "{}")
-    found=info.get("found"); H=info.get("innerH",800); W=info.get("innerW",400)
-    if found and 70<found["y"]<H-70:
-        print(f"found '{found['text']}' score={found.get('score')}",flush=True)
-        cdp("Input.synthesizeTapGesture",x=found["x"],y=found["y"])
-        print("real organic tap",flush=True)
-        for w in range(18):
-            time.sleep(1.4)
+print("=== SERP page 1 only ===", flush=True)
+success = False
+stale_bottom = 0
+for attempt in range(35):
+    try:
+        cur = (js("location.href") or "").lower()
+        if is_target(cur):
+            print("SUCCESS already on target", flush=True)
+            success = True
+            break
+    except Exception:
+        pass
+
+    info = json.loads(js(FIND_JS) or "{}")
+    found = info.get("found")
+    H = info.get("innerH", 800)
+    W = info.get("innerW", 400)
+    scrollY = info.get("scrollY", 0)
+    maxY = info.get("maxY", 0)
+
+    if attempt % 7 == 0:
+        print(f"  candidates={info.get('count',0)} scroll={scrollY:.0f}/{maxY:.0f}", flush=True)
+        if info.get("titles"):
+            print(f"  titles: {info.get('titles')[:4]}", flush=True)
+
+    if found and 40 < found["y"] < H - 40:
+        print(f"found '{found['text']}' score={found.get('score')}", flush=True)
+        cdp("Input.synthesizeTapGesture", x=found["x"], y=found["y"])
+        print("real organic tap", flush=True)
+        for w in range(16):
+            time.sleep(1.3)
             try:
-                now=(js("location.href") or "").lower()
-                if is_target(now): print("SUCCESS: organic landing",flush=True); success=True; break
-            except: pass
-            t=find_target_tab()
+                now = (js("location.href") or "").lower()
+                if is_target(now):
+                    print("SUCCESS: organic landing →", now[:100], flush=True)
+                    success = True
+                    break
+            except Exception:
+                pass
+            t = find_target_tab()
             if t:
                 try: ws.close()
-                except: pass
-                tab=t; ws=websocket.create_connection(tab["webSocketDebuggerUrl"],timeout=120,suppress_origin=True,ping_interval=12,ping_timeout=8)
-                cdp("Page.enable"); cdp("Runtime.enable"); success=True; break
-        if success: break
+                except Exception: pass
+                tab = t
+                ws = websocket.create_connection(
+                    tab["webSocketDebuggerUrl"], timeout=120,
+                    suppress_origin=True, ping_interval=12, ping_timeout=8
+                )
+                cdp("Page.enable"); cdp("Runtime.enable"); cdp("Network.enable")
+                print("SUCCESS: target tab", flush=True)
+                success = True
+                break
+        if success:
+            break
+        print("  tap did not land on domain – continue page 1", flush=True)
+        continue
+
+    if found:
+        smooth_scroll(int(found["y"] - H / 2), int(W / 2), int(H * 0.55))
     else:
-        if found: smooth_scroll(int(found["y"]-H/2),int(W/2),int(H*0.55))
+        if maxY > 0 and scrollY >= maxY - 40:
+            stale_bottom += 1
+            if stale_bottom >= 2:
+                print("  end of SERP page 1 – domain not found for this keyword", flush=True)
+                break
+            smooth_scroll(-int(H * 0.2), int(W / 2), int(H * 0.5))
         else:
-            if info.get("scrollY",0)>=info.get("maxY",0)-10 and attempt>4: break
-            smooth_scroll(int(H*0.35),int(W/2),int(H*0.6))
-if not success: print("FAILED organic click",flush=True); sys.exit(1)
+            stale_bottom = 0
+        smooth_scroll(int(H * 0.38), int(W / 2), int(H * 0.62))
 
-subprocess.run(["adb","exec-out","screencap","-p"],stdout=open(os.path.join(ARTIFACTS,"03-organic-landed.png"),"wb"),check=False)
+if not success:
+    print("KEYWORD_MISS", flush=True)
+    try:
+        open(os.path.join(ARTIFACTS, "page-debug.json"), "w").write(js(FIND_JS) or "{}")
+    except Exception:
+        pass
+    ws.close()
+    sys.exit(1)
+
+# ---- engagement ----
+subprocess.run(["adb", "exec-out", "screencap", "-p"],
+               stdout=open(os.path.join(ARTIFACTS, "03-organic-landed.png"), "wb"), check=False)
 time.sleep(2)
-subprocess.run(["adb","exec-out","screencap","-p"],stdout=open(os.path.join(ARTIFACTS,"04-organic-settled.png"),"wb"),check=False)
+subprocess.run(["adb", "exec-out", "screencap", "-p"],
+               stdout=open(os.path.join(ARTIFACTS, "04-organic-settled.png"), "wb"), check=False)
 
-print("\n=== ENGAGEMENT ===",flush=True)
+NUM_PAGES = random.randint(4, 6)
+MIN_DWELL, MAX_DWELL = 55, 110
+print("\n=== ENGAGEMENT ===", flush=True)
+
 def page_dims():
-    return json.loads(js("""(()=>JSON.stringify({H:window.innerHeight,W:window.innerWidth,scrollY:window.scrollY,maxY:Math.max(0,document.documentElement.scrollHeight-window.innerHeight)}))()""") or "{}")
-def smooth_scroll_random(sec):
-    end=time.time()+sec; count=0
-    while True:
-        remaining=end-time.time()
-        if remaining<=0.4: break
-        d=page_dims(); H,W=d.get("H",800),d.get("W",400); maxY,curY=d.get("maxY",0),d.get("scrollY",0)
-        direction=1 if (curY>=maxY-30 and maxY>0) else (-1 if curY<40 else (-1 if random.random()<0.75 else 1))
-        try:
-            cdp("Input.synthesizeScrollGesture",x=int(W*random.uniform(0.3,0.7)),y=int(H*random.uniform(0.4,0.7)),
-                yDistance=direction*random.randint(int(H*0.22),int(H*0.48)),speed=random.randint(220,420),gestureSourceType="touch")
-            count+=1
-        except Exception as e: print(f"scroll err: {e}",flush=True)
-        pause=random.uniform(2.2,5.0); remaining=end-time.time()
-        if remaining<=0: break
-        time.sleep(min(pause,remaining))
-    print(f"  {count} scrolls",flush=True)
-def find_good_links():
-    raw=js("""(()=>{const host=location.hostname.replace(/^www\\./,'').replace(/^m\\./,'');
-      const bad=['/about','/contact','/privacy','/terms','/licensing','/cookie'];
-      const vis=e=>{const r=e.getBoundingClientRect(),st=getComputedStyle(e);return r.width>12&&r.height>12&&st.visibility!=='hidden'&&st.display!=='none';};
-      const links=[...document.querySelectorAll('a[href]')].filter(a=>{try{const u=new URL(a.href,location.href);
-        if(u.hostname.replace(/^www\\./,'').replace(/^m\\./,'')!==host)return false;
-        if(bad.some(b=>u.pathname.toLowerCase().includes(b)))return false;
-        if(u.hash&&u.pathname===location.pathname)return false;return vis(a);}catch(e){return false;}});
-      const score=a=>{let s=0;const t=(a.innerText||'').trim().toLowerCase(),href=a.href.toLowerCase();
-        if(/\\/20[0-9]{2}\\//.test(href)||/\\/blog\\//.test(href))s+=8;
-        if(a.querySelector('h1,h2,h3,h4'))s+=5;if(t.length>25&&t.length<120)s+=3;return s;};
-      links.sort((x,y)=>score(y)-score(x));
-      return JSON.stringify(links.slice(0,18).map(a=>{const t=a.querySelector('h1,h2,h3,h4')||a;const r=t.getBoundingClientRect();
-        return {text:(t.innerText||'').trim().slice(0,80),href:a.href,x:r.left+r.width/2,y:r.top+r.height/2,score:score(a)};}));})()""")
-    try: return json.loads(raw or "[]")
-    except: return []
+    return json.loads(js("""(() => JSON.stringify({
+        H: window.innerHeight, W: window.innerWidth,
+        scrollY: window.scrollY,
+        maxY: Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
+    }))()""") or "{}")
 
-visited=set(); current=js("location.href") or ""
-print("starting on:",current,flush=True)
-for page_num in range(1,NUM_PAGES+1):
-    print(f"\n===== PAGE {page_num}/{NUM_PAGES} =====",flush=True)
-    dwell=random.randint(MIN_DWELL,MAX_DWELL); print(f"  dwell ~{dwell}s",flush=True)
+def smooth_scroll_random(sec):
+    end = time.time() + sec
+    count = 0
+    while True:
+        remaining = end - time.time()
+        if remaining <= 0.4:
+            break
+        d = page_dims()
+        H, W = d.get("H", 800), d.get("W", 400)
+        maxY, curY = d.get("maxY", 0), d.get("scrollY", 0)
+        if curY >= maxY - 30 and maxY > 0:
+            direction = 1
+        elif curY < 40:
+            direction = -1
+        else:
+            direction = -1 if random.random() < 0.75 else 1
+        try:
+            cdp("Input.synthesizeScrollGesture",
+                x=int(W * random.uniform(0.3, 0.7)),
+                y=int(H * random.uniform(0.4, 0.7)),
+                yDistance=direction * random.randint(int(H * 0.22), int(H * 0.48)),
+                speed=random.randint(220, 420),
+                gestureSourceType="touch")
+            count += 1
+        except Exception as e:
+            print(f"scroll err: {e}", flush=True)
+        pause = random.uniform(2.2, 5.0)
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(pause, remaining))
+    print(f"  {count} scrolls", flush=True)
+
+def find_good_links():
+    raw = js("""(() => {
+        const host = location.hostname.replace(/^www\\./,'').replace(/^m\\./,'');
+        const bad = ['/about','/contact','/privacy','/terms','/licensing','/cookie'];
+        const vis = e => {
+            const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+            return r.width > 12 && r.height > 12 && st.visibility !== 'hidden' && st.display !== 'none';
+        };
+        const links = [...document.querySelectorAll('a[href]')].filter(a => {
+            try {
+                const u = new URL(a.href, location.href);
+                if (u.hostname.replace(/^www\\./,'').replace(/^m\\./,'') !== host) return false;
+                if (bad.some(b => u.pathname.toLowerCase().includes(b))) return false;
+                if (u.hash && u.pathname === location.pathname) return false;
+                return vis(a);
+            } catch(e) { return false; }
+        });
+        const score = a => {
+            let s = 0;
+            const t = (a.innerText || '').trim().toLowerCase(), href = a.href.toLowerCase();
+            if (/\\/20[0-9]{2}\\//.test(href) || /\\/blog\\//.test(href)) s += 8;
+            if (a.querySelector('h1,h2,h3,h4')) s += 5;
+            if (t.length > 25 && t.length < 120) s += 3;
+            return s;
+        };
+        links.sort((x, y) => score(y) - score(x));
+        return JSON.stringify(links.slice(0, 18).map(a => {
+            const t = a.querySelector('h1,h2,h3,h4') || a;
+            const r = t.getBoundingClientRect();
+            return {text: (t.innerText||'').trim().slice(0,80), href: a.href,
+                    x: r.left+r.width/2, y: r.top+r.height/2, score: score(a)};
+        }));
+    })()""")
+    try:
+        return json.loads(raw or "[]")
+    except Exception:
+        return []
+
+visited = set()
+print("starting on:", js("location.href"), flush=True)
+for page_num in range(1, NUM_PAGES + 1):
+    print(f"\n===== PAGE {page_num}/{NUM_PAGES} =====", flush=True)
+    dwell = random.randint(MIN_DWELL, MAX_DWELL)
+    print(f"  dwell ~{dwell}s", flush=True)
     smooth_scroll_random(dwell)
     try:
-        name=f"0{4+page_num}-page{page_num}.png"
-        subprocess.run(["adb","exec-out","screencap","-p"],stdout=open(os.path.join(ARTIFACTS,name),"wb"),check=False)
-    except: pass
-    if page_num>=NUM_PAGES: break
-    links=find_good_links()
-    candidates=[L for L in links if L["href"] not in visited and L.get("score",0)>=3] or [L for L in links if L["href"] not in visited]
-    if not candidates: print("  no more links",flush=True); break
-    choice=random.choice(sorted(candidates,key=lambda x:x.get("score",0),reverse=True)[:6])
-    visited.add(choice["href"]); print(f"  tap '{choice['text'][:50]}'",flush=True)
-    old=(js("location.href") or "").rstrip("/")
-    cdp("Input.synthesizeTapGesture",x=choice["x"],y=choice["y"]); time.sleep(random.uniform(5.5, 8.0))
-    new=(js("location.href") or "").rstrip("/")
-    if new==old and choice["href"] not in new:
-        cdp("Page.navigate",url=choice["href"]); time.sleep(3.5)
-    print("  now:",js("location.href"),flush=True)
-print("\n===== FINAL =====",flush=True)
-smooth_scroll_random(random.randint(40,70))
-subprocess.run(["adb","exec-out","screencap","-p"],stdout=open(os.path.join(ARTIFACTS,"09-final.png"),"wb"),check=False)
-print("visited:",list(visited),flush=True); ws.close()
-print("DONE – Yahoo organic + multi-device engagement finished",flush=True)
+        name = f"0{4 + page_num}-page{page_num}.png"
+        subprocess.run(["adb", "exec-out", "screencap", "-p"],
+                       stdout=open(os.path.join(ARTIFACTS, name), "wb"), check=False)
+    except Exception:
+        pass
+    if page_num >= NUM_PAGES:
+        break
+    links = find_good_links()
+    candidates = [L for L in links if L["href"] not in visited and L.get("score", 0) >= 3] \
+                 or [L for L in links if L["href"] not in visited]
+    if not candidates:
+        print("  no more links", flush=True)
+        break
+    choice = random.choice(sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:6])
+    visited.add(choice["href"])
+    print(f"  tap '{choice['text'][:50]}'", flush=True)
+    old = (js("location.href") or "").rstrip("/")
+    cdp("Input.synthesizeTapGesture", x=choice["x"], y=choice["y"])
+    time.sleep(random.uniform(5.5, 8.0))
+    new = (js("location.href") or "").rstrip("/")
+    if new == old and choice["href"] not in new:
+        cdp("Page.navigate", url=choice["href"])
+        time.sleep(3.5)
+    print("  now:", js("location.href"), flush=True)
+
+print("\n===== FINAL =====", flush=True)
+smooth_scroll_random(random.randint(40, 70))
+subprocess.run(["adb", "exec-out", "screencap", "-p"],
+               stdout=open(os.path.join(ARTIFACTS, "09-final.png"), "wb"), check=False)
+print("visited:", list(visited), flush=True)
+ws.close()
+print("DONE", flush=True)
+sys.exit(0)
 PY
 }
 
@@ -416,40 +628,55 @@ log "waiting for first boot"
 wait_for_boot
 if ensure_root; then HAVE_ROOT=1; fi
 settle_device
-
 pick_android_device
 dump_identity
 
 if [[ "$HAVE_ROOT" == "1" ]]; then
   write_device_identity
   log "rebooting so identity props load"
-  adb reboot; wait_for_boot
+  adb reboot
+  wait_for_boot
   if ensure_root; then HAVE_ROOT=1; else HAVE_ROOT=0; fi
-  settle_device; dump_identity
+  settle_device
+  dump_identity
 else
   log "skipping /data/local.prop (no root)"
 fi
 
-resolve_chrome; skip_chrome_welcome
-open_url "$TARGET_URL"; sleep 6; dismiss_chrome_sheets; screenshot "01-yahoo-home.png"
-open_url "$SEARCH_URL"; sleep 9; dismiss_chrome_sheets; screenshot "02-search-results.png"
-if ! wait_for_devtools 30; then
-  log "DevTools not ready – restart Chrome and retry search page"
-  open_url "$SEARCH_URL"
-  sleep 12
-  dismiss_chrome_sheets
-  if ! wait_for_devtools 35; then
-    log "DevTools still not reachable – aborting"
-    screenshot "03-failed.png"
-    exit 1
-  fi
-fi
+resolve_chrome
+skip_chrome_welcome
 
-log "Starting Yahoo organic traffic as $MARKETNAME"
-if do_organic_and_engage; then
+open_url "$TARGET_URL"
+sleep 6
+dismiss_chrome_sheets
+screenshot "01-yahoo-home.png"
+
+install_websocket || {
+  log "Cannot install websocket-client – aborting"
+  screenshot "03-failed.png"
+  exit 1
+}
+
+HIT=0
+for kw in "${KW_ARR[@]}"; do
+  log "========== keyword attempt: $kw =========="
+  if try_keyword "$kw"; then
+    HIT=1
+    log "SUCCESS with keyword: $kw as $MARKETNAME"
+    break
+  else
+    log "Miss for keyword: $kw – trying next immediately"
+  fi
+done
+
+if [[ "$HIT" == "1" ]]; then
   screenshot "10-engagement-done.png"
   log "SUCCESS – $MARKETNAME"
-else
-  log "FAILED"; screenshot "03-failed.png"; exit 1
+  log "done"
+  ls -la "$ARTIFACTS"
+  exit 0
 fi
-log "done"; ls -la "$ARTIFACTS"
+
+log "ALL keywords missed on page 1 – no traffic this run"
+screenshot "03-failed-all-keywords.png"
+exit 0
