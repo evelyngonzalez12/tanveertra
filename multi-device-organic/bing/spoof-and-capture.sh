@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Bing organic – Android multi-device
-# Page 1 only, multi-keyword until domain found.
-# Artifacts: ONLY on failure (full SERP scrape + debug). No success page screenshots.
+# Bing organic – Android multi-device + GA4 Client Hints (model & OS version)
+# Artifacts: fail-only SERP scrapes. Success: identity only.
 set -euo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -10,7 +9,8 @@ mkdir -p "$ARTIFACTS"
 
 CHROME_PKG="com.android.chrome"
 HAVE_ROOT=0
-BRAND=""; MODEL=""; NAME=""; DEVICE=""; MARKETNAME=""; FINGERPRINT=""; SDK="14"; DENSITY="420"
+BRAND=""; MODEL=""; NAME=""; DEVICE=""; MARKETNAME=""; FINGERPRINT=""
+SDK="14"; DENSITY="420"; ANDROID_REL="14"; CHROME_MAJ="131"
 
 log() { printf '[capture] %s\n' "$*"; }
 adb_sh() { adb shell "$@" | tr -d '\r'; }
@@ -24,14 +24,10 @@ RESULT_HOST="${RESULT_HOST%%/*}"
 RAW_KEYWORDS="${SEARCH_KEYWORDS:-gardengar.com}"
 KEYWORDS_FILE="$(mktemp)"
 printf '%s\n' "$RAW_KEYWORDS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' > "$KEYWORDS_FILE" || true
-if [[ ! -s "$KEYWORDS_FILE" ]]; then
-  echo "gardengar.com" > "$KEYWORDS_FILE"
-fi
+[[ -s "$KEYWORDS_FILE" ]] || echo "gardengar.com" > "$KEYWORDS_FILE"
 mapfile -t KW_ARR < "$KEYWORDS_FILE"
 rm -f "$KEYWORDS_FILE"
-if ((${#KW_ARR[@]} > 1)); then
-  mapfile -t KW_ARR < <(printf '%s\n' "${KW_ARR[@]}" | shuf)
-fi
+((${#KW_ARR[@]} > 1)) && mapfile -t KW_ARR < <(printf '%s\n' "${KW_ARR[@]}" | shuf)
 
 log "Target domain: $RESULT_HOST"
 log "Keyword pool (${#KW_ARR[@]}): ${KW_ARR[*]}"
@@ -47,9 +43,7 @@ wait_for_boot() {
   done
   log "timed out waiting for boot"; return 1
 }
-
 uid_is_root() { [[ "$(adb_sh id -u 2>/dev/null || true)" == "0" ]]; }
-
 ensure_root() {
   local i out
   for i in 1 2 3 4 5 6; do
@@ -57,31 +51,43 @@ ensure_root() {
     out="$(adb root 2>&1 || true)"; log "adb root (${i}): ${out}"
     sleep 3; adb wait-for-device
   done
-  uid_is_root && { log "adb shell is root (uid=0)"; return 0; }
+  uid_is_root && return 0
   log "no root"; return 1
 }
 
+# brand|model|name|device|marketname|fingerprint|sdk|density|android_rel|chrome_maj
 pick_android_device() {
   local devices=(
-    "samsung|SM-S928B|e3sxxx|e3s|Galaxy S24 Ultra|samsung/e3sxxx/e3s:14/UP1A.231005.007/S928BXXS3AXKF:user/release-keys|14|420"
-    "samsung|SM-S911B|dm1q|dm1q|Galaxy S23|samsung/dm1qxxx/dm1q:14/UP1A.231005.007/S911BXXS3AXK1:user/release-keys|14|420"
-    "samsung|SM-A556B|a55x|a55x|Galaxy A55|samsung/a55xxx/a55x:14/UP1A.231005.007/A556BXXS3AXK1:user/release-keys|14|420"
-    "google|Pixel 8 Pro|husky|husky|Pixel 8 Pro|google/husky/husky:14/AP2A.240905.003/12234114:user/release-keys|14|420"
-    "google|Pixel 7|panther|panther|Pixel 7|google/panther/panther:14/AP2A.240905.003/12234114:user/release-keys|14|420"
-    "google|Pixel 6a|bluejay|bluejay|Pixel 6a|google/bluejay/bluejay:14/AP2A.240905.003/12234114:user/release-keys|14|420"
-    "OnePlus|CPH2449|OPD2101|OPD2101|OnePlus 11|OnePlus/CPH2449/OPD2101:14/UKQ1.230924.001/R.19a:user/release-keys|14|480"
-    "Xiaomi|23013PC75G|fuxi|fuxi|Xiaomi 13|Xiaomi/fuxi/fuxi:14/UKQ1.230917.001/V14.0.5.0:user/release-keys|14|440"
-    "samsung|SM-G991B|o1s|o1s|Galaxy S21|samsung/o1sxxx/o1s:13/TP1A.220624.014/G991BXXS6DWL1:user/release-keys|13|420"
-    "motorola|XT2301-4|rtwo|rtwo|moto g power 5G|motorola/rtwo/rtwo:14/U1TR34.29-61/61:user/release-keys|14|400"
+    "samsung|SM-S928B|e3sxxx|e3s|Galaxy S24 Ultra|samsung/e3sxxx/e3s:14/UP1A.231005.007/S928BXXS3AXKF:user/release-keys|14|420|14|131"
+    "samsung|SM-S928B|e3sxxx|e3s|Galaxy S24 Ultra|samsung/e3sxxx/e3s:15/AP3A.240905.015/S928BXXU4BXK1:user/release-keys|15|420|15|132"
+    "samsung|SM-S911B|dm1q|dm1q|Galaxy S23|samsung/dm1qxxx/dm1q:14/UP1A.231005.007/S911BXXS3AXK1:user/release-keys|14|420|14|130"
+    "samsung|SM-S901B|r0q|r0q|Galaxy S22|samsung/r0qxxx/r0q:13/TP1A.220624.014/S901BXXS7CWL1:user/release-keys|13|420|13|128"
+    "samsung|SM-A556B|a55x|a55x|Galaxy A55|samsung/a55xxx/a55x:14/UP1A.231005.007/A556BXXS3AXK1:user/release-keys|14|420|14|131"
+    "samsung|SM-A546B|a54x|a54x|Galaxy A54|samsung/a54xxx/a54x:14/UP1A.231005.007/A546BXXS8CWL1:user/release-keys|14|420|14|129"
+    "samsung|SM-G991B|o1s|o1s|Galaxy S21|samsung/o1sxxx/o1s:13/TP1A.220624.014/G991BXXS6DWL1:user/release-keys|13|420|13|127"
+    "google|Pixel 9 Pro|caiman|caiman|Pixel 9 Pro|google/caiman/caiman:15/AP3A.240905.015/12234114:user/release-keys|15|420|15|132"
+    "google|Pixel 8 Pro|husky|husky|Pixel 8 Pro|google/husky/husky:14/AP2A.240905.003/12234114:user/release-keys|14|420|14|131"
+    "google|Pixel 8|shiba|shiba|Pixel 8|google/shiba/shiba:14/AP2A.240905.003/12234114:user/release-keys|14|420|14|130"
+    "google|Pixel 7 Pro|cheetah|cheetah|Pixel 7 Pro|google/cheetah/cheetah:14/AP2A.240905.003/12234114:user/release-keys|14|420|14|129"
+    "google|Pixel 7|panther|panther|Pixel 7|google/panther/panther:14/AP2A.240905.003/12234114:user/release-keys|14|420|14|128"
+    "google|Pixel 6a|bluejay|bluejay|Pixel 6a|google/bluejay/bluejay:13/TQ3A.230805.001/12234114:user/release-keys|13|420|13|126"
+    "OnePlus|CPH2449|OPD2101|OPD2101|OnePlus 11|OnePlus/CPH2449/OPD2101:14/UKQ1.230924.001/R.19a:user/release-keys|14|480|14|131"
+    "OnePlus|CPH2581|aston|aston|OnePlus 12|OnePlus/CPH2581/aston:14/UKQ1.230924.001/R.20a:user/release-keys|14|480|14|132"
+    "Xiaomi|23013PC75G|fuxi|fuxi|Xiaomi 13|Xiaomi/fuxi/fuxi:14/UKQ1.230917.001/V14.0.5.0:user/release-keys|14|440|14|130"
+    "Xiaomi|23127PN0CG|houji|houji|Xiaomi 14|Xiaomi/houji/houji:15/AP3A.240905.015/V16.0.1.0:user/release-keys|15|440|15|132"
+    "motorola|XT2301-4|rtwo|rtwo|moto g power 5G|motorola/rtwo/rtwo:14/U1TR34.29-61/61:user/release-keys|14|400|14|129"
+    "Nothing|A065|Pong|Pong|Nothing Phone (2)|Nothing/Pong/Pong:14/UKQ1.230917.001/1:user/release-keys|14|420|14|131"
   )
   local choice="${devices[RANDOM % ${#devices[@]}]}"
-  IFS='|' read -r BRAND MODEL NAME DEVICE MARKETNAME FINGERPRINT SDK DENSITY <<< "$choice"
-  log "Selected device: $MARKETNAME ($MODEL) Android $SDK"
+  IFS='|' read -r BRAND MODEL NAME DEVICE MARKETNAME FINGERPRINT SDK DENSITY ANDROID_REL CHROME_MAJ <<< "$choice"
+  # Full Chrome UA with real model (not reduced "K") so GA4 + Client Hints can see it
+  UA_STRING="Mozilla/5.0 (Linux; Android ${ANDROID_REL}; ${MODEL}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJ}.0.0.0 Mobile Safari/537.36"
+  export BRAND MODEL NAME DEVICE MARKETNAME FINGERPRINT SDK DENSITY ANDROID_REL CHROME_MAJ UA_STRING
+  log "Selected device: $MARKETNAME ($MODEL) Android $ANDROID_REL Chrome/$CHROME_MAJ"
 }
 
 write_device_identity() {
-  local tmp
-  tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp)"
   cat > "$tmp" <<PROP
 ro.product.brand=${BRAND}
 ro.product.manufacturer=${BRAND}
@@ -92,7 +98,7 @@ ro.product.marketname=${MARKETNAME}
 ro.build.fingerprint=${FINGERPRINT}
 ro.build.type=user
 ro.build.tags=release-keys
-ro.build.version.release=${SDK}
+ro.build.version.release=${ANDROID_REL}
 ro.build.version.sdk=${SDK}
 ro.sf.lcd_density=${DENSITY}
 PROP
@@ -112,8 +118,12 @@ dump_identity() {
       persist.sys.locale persist.sys.timezone; do
       printf '%s=%s\n' "$key" "$(adb_sh getprop "$key")"
     done
-    echo; echo "=== selected profile ==="
-    echo "marketname=$MARKETNAME model=$MODEL brand=$BRAND sdk=$SDK"
+    echo; echo "=== GA4 Client Hints profile ==="
+    echo "marketname=$MARKETNAME"
+    echo "model=$MODEL"
+    echo "android=$ANDROID_REL"
+    echo "chrome=$CHROME_MAJ"
+    echo "ua=$UA_STRING"
     echo "domain=$RESULT_HOST"
     echo "keywords=${KW_ARR[*]}"
   } | tee "$ARTIFACTS/identity.txt"
@@ -125,7 +135,7 @@ skip_chrome_welcome() {
   adb shell am set-debug-app --persistent "$CHROME_PKG" >/dev/null || true
   adb push "$tmp" /data/local/tmp/chrome-command-line >/dev/null
   adb_sh chmod 644 /data/local/tmp/chrome-command-line || true
-  [[ "$HAVE_ROOT" == "1" ]] && { adb push "$tmp" /data/local/chrome-command-line >/dev/null || true; }
+  [[ "$HAVE_ROOT" == "1" ]] && adb push "$tmp" /data/local/chrome-command-line >/dev/null || true
   rm -f "$tmp"
   adb shell pm grant "$CHROME_PKG" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
   adb shell am force-stop "$CHROME_PKG" >/dev/null 2>&1 || true
@@ -183,26 +193,20 @@ wait_for_devtools() {
     if curl -s --max-time 3 http://127.0.0.1:9222/json >/dev/null 2>&1; then
       local count
       count=$(curl -s --max-time 3 http://127.0.0.1:9222/json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len([t for t in d if t.get('type')=='page']))" 2>/dev/null || echo 0)
-      if [[ "$count" -gt 0 ]]; then
-        log "DevTools ready (${count} tab(s))"
-        return 0
-      fi
+      if [[ "$count" -gt 0 ]]; then log "DevTools ready (${count} tab(s))"; return 0; fi
     fi
-    sleep 1.5
-    i=$((i+1))
+    sleep 1.5; i=$((i+1))
     if (( i % 5 == 0 )); then
       adb forward --remove tcp:9222 >/dev/null 2>&1 || true
       adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
     fi
   done
-  log "DevTools wait timed out after ${max} attempts"
-  return 1
+  log "DevTools wait timed out"; return 1
 }
 
-# Only used on FAILURE
 screenshot_fail() {
   adb exec-out screencap -p > "${ARTIFACTS}/$1" 2>/dev/null || true
-  log "FAIL artifact: ${ARTIFACTS}/$1"
+  log "FAIL artifact: $1"
 }
 
 settle_device() {
@@ -219,21 +223,16 @@ install_websocket() {
   log "Installing websocket-client..."
   python3 -m pip install -q websocket-client --break-system-packages >/dev/null 2>&1 \
     || python3 -m pip install -q websocket-client >/dev/null 2>&1 || true
-  if python3 -c "import websocket" 2>/dev/null; then
-    log "websocket-client OK"
-    return 0
-  fi
-  log "ERROR: websocket module still missing"
-  return 1
+  python3 -c "import websocket" 2>/dev/null && { log "websocket-client OK"; return 0; }
+  log "ERROR: websocket missing"; return 1
 }
 
 try_keyword() {
   local keyword="$1"
-  local encoded
+  local encoded safe_kw
   encoded="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$keyword")"
-  local search_url="https://www.bing.com/search?q=${encoded}"
-  local safe_kw
   safe_kw="$(echo "$keyword" | tr ' /' '__' | tr -cd '[:alnum:]_-' | cut -c1-40)"
+  local search_url="https://www.bing.com/search?q=${encoded}"
 
   log "Trying keyword: $keyword"
   open_url "$search_url"
@@ -241,25 +240,25 @@ try_keyword() {
   dismiss_chrome_sheets
 
   if ! wait_for_devtools 25; then
-    log "DevTools not ready – retry open"
-    open_url "$search_url"
-    sleep 10
-    dismiss_chrome_sheets
-    wait_for_devtools 30 || { log "DevTools failed for this keyword"; return 1; }
+    open_url "$search_url"; sleep 10; dismiss_chrome_sheets
+    wait_for_devtools 30 || { log "DevTools failed"; return 1; }
   fi
 
-  RESULT_TEXT="$keyword" \
-  RESULT_HOST="$RESULT_HOST" \
-  ARTIFACTS="$ARTIFACTS" \
-  SAFE_KW="$safe_kw" \
+  RESULT_TEXT="$keyword" RESULT_HOST="$RESULT_HOST" ARTIFACTS="$ARTIFACTS" SAFE_KW="$safe_kw" \
+  UA_STRING="$UA_STRING" MODEL="$MODEL" ANDROID_REL="$ANDROID_REL" CHROME_MAJ="$CHROME_MAJ" MARKETNAME="$MARKETNAME" \
   python3 - <<'PY'
-import json, os, sys, time, random, urllib.request, subprocess, base64, re
+import json, os, sys, time, random, urllib.request, subprocess, base64
 import websocket
 
 HOST = os.environ["RESULT_HOST"].strip().lower().replace("www.", "")
 TARGET = os.environ["RESULT_TEXT"].strip().lower()
 ARTIFACTS = os.environ["ARTIFACTS"]
 SAFE_KW = os.environ.get("SAFE_KW", "kw")
+UA_STRING = os.environ.get("UA_STRING", "")
+MODEL = os.environ.get("MODEL", "")
+ANDROID_REL = os.environ.get("ANDROID_REL", "14")
+CHROME_MAJ = os.environ.get("CHROME_MAJ", "131")
+MARKETNAME = os.environ.get("MARKETNAME", MODEL)
 
 def get_tabs():
     with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=8) as r:
@@ -286,7 +285,7 @@ def find_target_tab():
     return None
 
 tab = None
-for attempt in range(30):
+for _ in range(30):
     tab = find_serp_tab()
     if tab:
         break
@@ -328,55 +327,84 @@ def cdp(method, **params):
                 tab["webSocketDebuggerUrl"], timeout=120, suppress_origin=True,
                 ping_interval=12, ping_timeout=8
             )
+            apply_ua_override()
     raise RuntimeError("CDP failed")
 
 def js(expr):
     r = cdp("Runtime.evaluate", expression=expr, returnByValue=True)
     return r.get("result", {}).get("value")
 
+def apply_ua_override():
+    """Critical for GA4 Device model + OS version on Android web."""
+    if not UA_STRING:
+        return
+    ver = str(CHROME_MAJ)
+    full = f"{ver}.0.0.0"
+    metadata = {
+        "brands": [
+            {"brand": "Chromium", "version": ver},
+            {"brand": "Google Chrome", "version": ver},
+            {"brand": "Not_A Brand", "version": "24"},
+        ],
+        "fullVersionList": [
+            {"brand": "Chromium", "version": full},
+            {"brand": "Google Chrome", "version": full},
+            {"brand": "Not_A Brand", "version": "10.0.0.0"},
+        ],
+        "platform": "Android",
+        "platformVersion": f"{ANDROID_REL}.0.0",
+        "architecture": "",
+        "model": MODEL,
+        "mobile": True,
+        "bitness": "",
+        "wow64": False,
+    }
+    try:
+        cdp(
+            "Network.setUserAgentOverride",
+            userAgent=UA_STRING,
+            platform="Linux armv8l",
+            userAgentMetadata=metadata,
+        )
+        print(f"GA4 UA applied: {MARKETNAME} model={MODEL} Android/{ANDROID_REL} Chrome/{ver}", flush=True)
+    except Exception as e:
+        print(f"UA override failed: {e}", flush=True)
+
 cdp("Page.enable")
 cdp("Runtime.enable")
 cdp("Network.enable")
-print(f"domain={HOST}  keyword={TARGET}", flush=True)
+apply_ua_override()
+# Reload so first request to Bing already carries Client Hints
+try:
+    cdp("Page.reload", ignoreCache=True)
+    time.sleep(4)
+except Exception:
+    pass
 
+print(f"domain={HOST} keyword={TARGET}", flush=True)
 KW_TOKENS = [w for w in TARGET.replace("-", " ").split() if len(w) > 2][:8]
 
-# Full SERP scrape – all organic results with decoded Bing redirects
 SCRAPE_JS = r"""(() => {
   const HOST = %s;
   function decodeBingHref(href) {
     try {
       const u = new URL(href, location.href);
-      // Bing ck redirect: &u=a1XXXX (base64 of target URL after a1 prefix)
       const uParam = u.searchParams.get('u');
       if (uParam) {
-        let raw = uParam;
-        if (raw.startsWith('a1')) raw = raw.slice(2);
-        try {
-          const pad = '='.repeat((4 - (raw.length %% 4)) %% 4);
-          const decoded = atob(raw + pad);
-          if (decoded.startsWith('http')) return decoded;
-        } catch (e) {}
-        try {
-          // sometimes URL-safe base64
-          raw = raw.replace(/-/g, '+').replace(/_/g, '/');
-          const pad = '='.repeat((4 - (raw.length %% 4)) %% 4);
-          const decoded = atob(raw + pad);
-          if (decoded.startsWith('http')) return decoded;
-        } catch (e) {}
+        let raw = uParam.startsWith('a1') ? uParam.slice(2) : uParam;
+        for (const r of [raw, raw.replace(/-/g, '+').replace(/_/g, '/')]) {
+          try {
+            const pad = '='.repeat((4 - (r.length %% 4)) %% 4);
+            const decoded = atob(r + pad);
+            if (decoded.startsWith('http')) return decoded;
+          } catch (e) {}
+        }
       }
-      // r= parameter
-      const r = u.searchParams.get('r');
-      if (r && r.startsWith('http')) return r;
     } catch (e) {}
     return href;
   }
   function hostOf(url) {
-    try {
-      return new URL(url).hostname.replace(/^www\./, '').toLowerCase();
-    } catch (e) {
-      return '';
-    }
+    try { return new URL(url).hostname.replace(/^www\./, '').toLowerCase(); } catch (e) { return ''; }
   }
   const vis = e => {
     const r = e.getBoundingClientRect(), st = getComputedStyle(e);
@@ -384,38 +412,26 @@ SCRAPE_JS = r"""(() => {
   };
   const results = [];
   const seen = new Set();
-  // Prefer classic Bing organic cards
   let cards = [...document.querySelectorAll('li.b_algo, .b_algo, #b_results > li, .b_results > li')];
+  if (!cards.length) cards = [...document.querySelectorAll('#b_results li, [data-bm]')];
   if (!cards.length) {
-    cards = [...document.querySelectorAll('#b_results li, ol#b_results > li, [data-bm]')];
-  }
-  // Fallback: any block that looks like a result
-  if (!cards.length) {
-    cards = [...document.querySelectorAll('main li, #b_content li')].filter(el => {
-      return el.querySelector('h2, h3, a') && (el.innerText || '').length > 30;
-    });
+    cards = [...document.querySelectorAll('main li, #b_content li')].filter(el =>
+      el.querySelector('h2,h3,a') && (el.innerText||'').length > 30);
   }
   for (const card of cards) {
     const citeEl = card.querySelector('cite, .b_attribution, .b_cite, [class*="cite"]');
     const citeText = (citeEl ? citeEl.innerText : '') || '';
     const titleEl = card.querySelector('h2, h3, [role="heading"]') || card.querySelector('a');
     const title = (titleEl ? titleEl.innerText : '').trim().slice(0, 160);
-    const links = [...card.querySelectorAll('a[href]')];
-    let bestHref = '';
-    let decoded = '';
-    let domain = '';
-    for (const a of links) {
+    let bestHref = '', decoded = '', domain = '';
+    for (const a of card.querySelectorAll('a[href]')) {
       const href = a.href || '';
       if (!href || href.startsWith('javascript:')) continue;
       const d = decodeBingHref(href);
       const h = hostOf(d);
       if (!h || h.includes('bing.com') || h.includes('microsoft.com') || h.includes('msn.com')) continue;
-      bestHref = href;
-      decoded = d;
-      domain = h;
-      break;
+      bestHref = href; decoded = d; domain = h; break;
     }
-    // Domain from cite if href decode failed
     if (!domain && citeText) {
       const m = citeText.toLowerCase().match(/([a-z0-9][-a-z0-9]*\.(?:com|net|org|io|co|uk|info|biz|app)(?:\.[a-z]{2})?)/);
       if (m) domain = m[1].replace(/^www\./, '');
@@ -424,49 +440,36 @@ SCRAPE_JS = r"""(() => {
     const key = domain + '|' + title.slice(0, 40);
     if (seen.has(key)) continue;
     seen.add(key);
-    const tapEl = titleEl || links[0] || card;
+    const tapEl = titleEl || card;
     const r = tapEl.getBoundingClientRect();
     const cardText = (card.innerText || '').toLowerCase();
     results.push({
-      position: results.length + 1,
-      domain: domain,
-      title: title,
-      cite: citeText.trim().slice(0, 120),
-      href: bestHref.slice(0, 300),
-      decoded_url: decoded.slice(0, 300),
+      position: results.length + 1, domain, title, cite: citeText.trim().slice(0, 120),
+      href: bestHref.slice(0, 300), decoded_url: decoded.slice(0, 300),
       is_target: domain.includes(HOST) || cardText.includes(HOST) || (decoded || '').toLowerCase().includes(HOST),
-      x: r.left + r.width / 2,
-      y: r.top + r.height / 2,
-      visible: vis(tapEl)
+      x: r.left + r.width / 2, y: r.top + r.height / 2, visible: vis(tapEl)
     });
   }
-  // Also collect every unique external domain from any link on page (extra safety)
-  const allDomains = [];
-  const domSeen = new Set();
+  const allDomains = [], domSeen = new Set();
   for (const a of document.querySelectorAll('a[href]')) {
     const d = hostOf(decodeBingHref(a.href || ''));
-    if (!d || d.includes('bing.') || d.includes('microsoft.') || d.includes('msn.') || d.includes('live.com')) continue;
+    if (!d || d.includes('bing.') || d.includes('microsoft.') || d.includes('msn.')) continue;
     if (domSeen.has(d)) continue;
-    domSeen.add(d);
-    allDomains.push(d);
+    domSeen.add(d); allDomains.push(d);
   }
   return JSON.stringify({
-    page_url: location.href,
-    page_title: document.title,
-    result_count: results.length,
-    target_host: HOST,
+    page_url: location.href, page_title: document.title,
+    result_count: results.length, target_host: HOST,
     target_found_in_results: results.some(r => r.is_target),
     target_found_in_all_domains: allDomains.some(d => d.includes(HOST)),
-    results: results,
-    all_domains_on_page: allDomains,
-    innerH: window.innerHeight,
-    innerW: window.innerWidth,
+    results, all_domains_on_page: allDomains,
+    ua: navigator.userAgent,
+    innerH: window.innerHeight, innerW: window.innerWidth,
     scrollY: window.scrollY,
     maxY: Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
   });
 })()""" % json.dumps(HOST)
 
-# Finder: match target using scrape data + decode
 FIND_JS = r"""(() => {
   const HOST = %s;
   const TOKENS = %s;
@@ -511,10 +514,7 @@ FIND_JS = r"""(() => {
       const d = decodeBingHref(link.href || '');
       const h = hostOf(d);
       if (h.includes(HOST) || d.toLowerCase().includes(HOST)) {
-        matched = true;
-        a = link;
-        decoded = d;
-        break;
+        matched = true; a = link; decoded = d; break;
       }
     }
     if (!matched) continue;
@@ -532,19 +532,14 @@ FIND_JS = r"""(() => {
     candidates.push({
       tag: titleEl.tagName,
       text: (titleEl.innerText || a.innerText || '').trim().slice(0, 120),
-      href: a.href,
-      decoded: decoded.slice(0, 200),
-      x: r.left + r.width / 2,
-      y: r.top + r.height / 2,
-      score
+      href: a.href, decoded: decoded.slice(0, 200),
+      x: r.left + r.width / 2, y: r.top + r.height / 2, score
     });
   }
   candidates.sort((x, y) => y.score - x.score);
   return JSON.stringify({
-    found: candidates[0] || null,
-    count: candidates.length,
-    innerH: window.innerHeight,
-    innerW: window.innerWidth,
+    found: candidates[0] || null, count: candidates.length,
+    innerH: window.innerHeight, innerW: window.innerWidth,
     scrollY: window.scrollY,
     maxY: Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
   });
@@ -552,59 +547,45 @@ FIND_JS = r"""(() => {
 
 
 def save_fail_debug(reason):
-    """Scrape full page-1 results and write fail-only artifacts."""
     try:
-        scrape = js(SCRAPE_JS) or "{}"
-        data = json.loads(scrape)
+        data = json.loads(js(SCRAPE_JS) or "{}")
     except Exception as e:
-        data = {"error": str(e), "raw": None}
-        scrape = json.dumps(data)
+        data = {"error": str(e)}
     path_json = os.path.join(ARTIFACTS, f"FAIL-serp-{SAFE_KW}.json")
     path_txt = os.path.join(ARTIFACTS, f"FAIL-serp-{SAFE_KW}.txt")
     with open(path_json, "w") as f:
         f.write(json.dumps(data, indent=2))
     lines = [
-        f"keyword: {TARGET}",
-        f"target_domain: {HOST}",
-        f"reason: {reason}",
+        f"keyword: {TARGET}", f"target_domain: {HOST}", f"reason: {reason}",
         f"page_url: {data.get('page_url', '')}",
+        f"ua_seen: {data.get('ua', '')}",
         f"target_found_in_results: {data.get('target_found_in_results')}",
         f"target_found_in_all_domains: {data.get('target_found_in_all_domains')}",
         f"result_count: {data.get('result_count')}",
-        "",
-        "=== ALL DOMAINS ON PAGE 1 ===",
+        "", "=== ALL DOMAINS ON PAGE 1 ===",
     ]
     for d in data.get("all_domains_on_page") or []:
-        mark = " <<<< TARGET" if HOST in d else ""
-        lines.append(f"  - {d}{mark}")
+        lines.append(f"  - {d}" + (" <<<< TARGET" if HOST in d else ""))
     lines.append("")
-    lines.append("=== ORGANIC RESULTS (position, domain, title) ===")
+    lines.append("=== ORGANIC RESULTS ===")
     for r in data.get("results") or []:
         mark = " <<<< TARGET MATCH" if r.get("is_target") else ""
-        lines.append(f"  #{r.get('position')}  domain={r.get('domain')}{mark}")
+        lines.append(f"  #{r.get('position')} domain={r.get('domain')}{mark}")
         lines.append(f"      title: {r.get('title')}")
         lines.append(f"      cite:  {r.get('cite')}")
-        lines.append(f"      decoded: {r.get('decoded_url', '')[:120]}")
-        lines.append(f"      xy=({r.get('x'):.0f},{r.get('y'):.0f}) visible={r.get('visible')}")
+        lines.append(f"      decoded: {(r.get('decoded_url') or '')[:120]}")
     with open(path_txt, "w") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"FAIL debug written: {path_txt}", flush=True)
-    print(f"  target_found_in_results={data.get('target_found_in_results')} domains={data.get('all_domains_on_page')}", flush=True)
-    # screenshot only on fail
+    print(f"FAIL debug: {path_txt}", flush=True)
     try:
-        subprocess.run(
-            ["adb", "exec-out", "screencap", "-p"],
-            stdout=open(os.path.join(ARTIFACTS, f"FAIL-serp-{SAFE_KW}.png"), "wb"),
-            check=False,
-        )
+        subprocess.run(["adb", "exec-out", "screencap", "-p"],
+                       stdout=open(os.path.join(ARTIFACTS, f"FAIL-serp-{SAFE_KW}.png"), "wb"), check=False)
     except Exception:
         pass
-    return data
 
 
 def smooth_scroll(dist, x, y):
-    cdp("Input.synthesizeScrollGesture", x=x, y=y, yDistance=-dist,
-        speed=450, gestureSourceType="touch")
+    cdp("Input.synthesizeScrollGesture", x=x, y=y, yDistance=-dist, speed=450, gestureSourceType="touch")
     time.sleep(1.1)
 
 
@@ -613,59 +594,47 @@ def is_target(url):
     return HOST in u and "bing." not in u and "chrome-error" not in u
 
 
-# Wait for results to paint
 for _ in range(10):
     try:
-        body = js("document.body && document.body.innerText ? document.body.innerText.length : 0") or 0
-        if body > 400:
+        if (js("document.body && document.body.innerText ? document.body.innerText.length : 0") or 0) > 400:
             break
     except Exception:
         pass
     time.sleep(1)
 
-print("=== SERP page 1 only ===", flush=True)
-# Initial scrape log (console only – not artifact unless fail)
+print("=== SERP page 1 ===", flush=True)
 try:
     pre = json.loads(js(SCRAPE_JS) or "{}")
-    print(f"  scrape: {pre.get('result_count', 0)} results, domains={pre.get('all_domains_on_page', [])[:12]}", flush=True)
-    print(f"  target_in_results={pre.get('target_found_in_results')} target_in_domains={pre.get('target_found_in_all_domains')}", flush=True)
+    print(f"  results={pre.get('result_count')} domains={pre.get('all_domains_on_page', [])[:10]}", flush=True)
+    print(f"  target_in_results={pre.get('target_found_in_results')} ua={str(pre.get('ua',''))[:80]}", flush=True)
 except Exception as e:
-    print(f"  pre-scrape err: {e}", flush=True)
+    print(f"  pre-scrape: {e}", flush=True)
 
 success = False
 stale_bottom = 0
 for attempt in range(40):
     try:
-        cur = (js("location.href") or "").lower()
-        if is_target(cur):
+        if is_target(js("location.href") or ""):
             print("SUCCESS already on target", flush=True)
             success = True
             break
     except Exception:
         pass
-
     info = json.loads(js(FIND_JS) or "{}")
     found = info.get("found")
-    H = info.get("innerH", 800)
-    W = info.get("innerW", 400)
-    scrollY = info.get("scrollY", 0)
-    maxY = info.get("maxY", 0)
-
+    H, W = info.get("innerH", 800), info.get("innerW", 400)
+    scrollY, maxY = info.get("scrollY", 0), info.get("maxY", 0)
     if attempt % 5 == 0:
-        print(f"  attempt={attempt} candidates={info.get('count', 0)} scroll={scrollY:.0f}/{maxY:.0f}", flush=True)
-        if found:
-            print(f"  best: '{found.get('text', '')[:60]}' score={found.get('score')}", flush=True)
-
+        print(f"  attempt={attempt} candidates={info.get('count',0)} scroll={scrollY:.0f}/{maxY:.0f}", flush=True)
     if found and 30 < found["y"] < H - 30:
-        print(f"found '{found['text']}' score={found.get('score')} y={found['y']:.0f}", flush=True)
+        print(f"found '{found['text']}' score={found.get('score')}", flush=True)
         cdp("Input.synthesizeTapGesture", x=found["x"], y=found["y"])
         print("real organic tap", flush=True)
-        for w in range(18):
+        for _ in range(18):
             time.sleep(1.2)
             try:
-                now = (js("location.href") or "").lower()
-                if is_target(now):
-                    print("SUCCESS: organic landing →", now[:100], flush=True)
+                if is_target(js("location.href") or ""):
+                    print("SUCCESS: organic landing", flush=True)
                     success = True
                     break
             except Exception:
@@ -678,20 +647,17 @@ for attempt in range(40):
                     pass
                 tab = t
                 ws = websocket.create_connection(
-                    tab["webSocketDebuggerUrl"], timeout=120,
-                    suppress_origin=True, ping_interval=12, ping_timeout=8
+                    tab["webSocketDebuggerUrl"], timeout=120, suppress_origin=True,
+                    ping_interval=12, ping_timeout=8
                 )
-                cdp("Page.enable")
-                cdp("Runtime.enable")
-                cdp("Network.enable")
+                cdp("Page.enable"); cdp("Runtime.enable"); cdp("Network.enable")
+                apply_ua_override()
                 print("SUCCESS: target tab", flush=True)
                 success = True
                 break
         if success:
             break
-        print("  tap did not land – continue", flush=True)
         continue
-
     if found:
         smooth_scroll(int(found["y"] - H / 2), int(W / 2), int(H * 0.55))
     else:
@@ -707,14 +673,21 @@ for attempt in range(40):
 
 if not success:
     print("KEYWORD_MISS", flush=True)
-    save_fail_debug("domain not found or tap failed on page 1")
+    save_fail_debug("domain not found or tap failed")
     ws.close()
     sys.exit(1)
 
-# ---- engagement (no screenshots on success) ----
+# Re-apply UA on destination site (GA4 on gardengar.com)
+apply_ua_override()
+try:
+    cdp("Page.reload", ignoreCache=False)
+    time.sleep(3)
+except Exception:
+    pass
+
 NUM_PAGES = random.randint(4, 6)
 MIN_DWELL, MAX_DWELL = 55, 110
-print("\n=== ENGAGEMENT (no success screenshots) ===", flush=True)
+print("\n=== ENGAGEMENT ===", flush=True)
 
 
 def page_dims():
@@ -746,8 +719,7 @@ def smooth_scroll_random(sec):
                 x=int(W * random.uniform(0.3, 0.7)),
                 y=int(H * random.uniform(0.4, 0.7)),
                 yDistance=direction * random.randint(int(H * 0.22), int(H * 0.48)),
-                speed=random.randint(220, 420),
-                gestureSourceType="touch")
+                speed=random.randint(220, 420), gestureSourceType="touch")
             count += 1
         except Exception as e:
             print(f"scroll err: {e}", flush=True)
@@ -823,6 +795,7 @@ for page_num in range(1, NUM_PAGES + 1):
     if new == old and choice["href"] not in new:
         cdp("Page.navigate", url=choice["href"])
         time.sleep(3.5)
+        apply_ua_override()
     print("  now:", js("location.href"), flush=True)
 
 print("\n===== FINAL =====", flush=True)
@@ -856,38 +829,29 @@ fi
 
 resolve_chrome
 skip_chrome_welcome
-
 open_url "$TARGET_URL"
 sleep 6
 dismiss_chrome_sheets
-# no home screenshot on success path
 
-install_websocket || {
-  log "Cannot install websocket-client – aborting"
-  screenshot_fail "FAIL-websocket.png"
-  exit 1
-}
+install_websocket || { log "websocket missing"; screenshot_fail "FAIL-websocket.png"; exit 1; }
 
 HIT=0
 for kw in "${KW_ARR[@]}"; do
   log "========== keyword attempt: $kw =========="
   if try_keyword "$kw"; then
     HIT=1
-    log "SUCCESS with keyword: $kw as $MARKETNAME"
+    log "SUCCESS with keyword: $kw as $MARKETNAME ($MODEL) Android $ANDROID_REL"
     break
   else
-    log "Miss for keyword: $kw – trying next immediately"
+    log "Miss for keyword: $kw – next"
   fi
 done
 
 if [[ "$HIT" == "1" ]]; then
-  log "SUCCESS – $MARKETNAME (no success screenshots saved)"
-  log "done"
-  # keep only identity.txt from success runs
+  log "SUCCESS – $MARKETNAME model=$MODEL Android=$ANDROID_REL (GA4 Client Hints applied)"
   ls -la "$ARTIFACTS" || true
   exit 0
 fi
-
-log "ALL keywords missed on page 1 – see FAIL-serp-*.json/txt/png in artifacts"
+log "ALL keywords missed – see FAIL-serp-* artifacts"
 screenshot_fail "FAIL-all-keywords.png"
 exit 0
