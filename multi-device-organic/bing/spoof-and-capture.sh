@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Bing organic – Android multi-device
-# Tries keywords one-by-one on SERP page 1 only until domain is found.
+# Page 1 only, multi-keyword until domain found.
+# Artifacts: ONLY on failure (full SERP scrape + debug). No success page screenshots.
 set -euo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -14,7 +15,6 @@ BRAND=""; MODEL=""; NAME=""; DEVICE=""; MARKETNAME=""; FINGERPRINT=""; SDK="14";
 log() { printf '[capture] %s\n' "$*"; }
 adb_sh() { adb shell "$@" | tr -d '\r'; }
 
-# ---- domain + keyword pool from GitHub Actions ----
 RESULT_HOST="${TARGET_DOMAIN:-gardengar.com}"
 RESULT_HOST="${RESULT_HOST#www.}"
 RESULT_HOST="${RESULT_HOST#https://}"
@@ -29,14 +29,12 @@ if [[ ! -s "$KEYWORDS_FILE" ]]; then
 fi
 mapfile -t KW_ARR < "$KEYWORDS_FILE"
 rm -f "$KEYWORDS_FILE"
-
 if ((${#KW_ARR[@]} > 1)); then
   mapfile -t KW_ARR < <(printf '%s\n' "${KW_ARR[@]}" | shuf)
 fi
 
 log "Target domain: $RESULT_HOST"
 log "Keyword pool (${#KW_ARR[@]}): ${KW_ARR[*]}"
-
 TARGET_URL="https://www.bing.com"
 export RESULT_HOST TARGET_URL
 
@@ -193,7 +191,6 @@ wait_for_devtools() {
     sleep 1.5
     i=$((i+1))
     if (( i % 5 == 0 )); then
-      log "DevTools not ready yet (attempt $i/$max) – re-forwarding"
       adb forward --remove tcp:9222 >/dev/null 2>&1 || true
       adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
     fi
@@ -202,9 +199,10 @@ wait_for_devtools() {
   return 1
 }
 
-screenshot() {
-  adb exec-out screencap -p > "${ARTIFACTS}/$1"
-  log "wrote ${ARTIFACTS}/$1"
+# Only used on FAILURE
+screenshot_fail() {
+  adb exec-out screencap -p > "${ARTIFACTS}/$1" 2>/dev/null || true
+  log "FAIL artifact: ${ARTIFACTS}/$1"
 }
 
 settle_device() {
@@ -229,21 +227,21 @@ install_websocket() {
   return 1
 }
 
-# Try one keyword: SERP page 1 only. Returns 0 on success.
 try_keyword() {
   local keyword="$1"
   local encoded
   encoded="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$keyword")"
   local search_url="https://www.bing.com/search?q=${encoded}"
+  local safe_kw
+  safe_kw="$(echo "$keyword" | tr ' /' '__' | tr -cd '[:alnum:]_-' | cut -c1-40)"
 
   log "Trying keyword: $keyword"
   open_url "$search_url"
   sleep 8
   dismiss_chrome_sheets
-  screenshot "02-search-$(echo "$keyword" | tr ' /' '__' | cut -c1-40).png"
 
   if ! wait_for_devtools 25; then
-    log "DevTools not ready for keyword – retry open"
+    log "DevTools not ready – retry open"
     open_url "$search_url"
     sleep 10
     dismiss_chrome_sheets
@@ -253,13 +251,15 @@ try_keyword() {
   RESULT_TEXT="$keyword" \
   RESULT_HOST="$RESULT_HOST" \
   ARTIFACTS="$ARTIFACTS" \
+  SAFE_KW="$safe_kw" \
   python3 - <<'PY'
-import json, os, sys, time, random, urllib.request, subprocess
+import json, os, sys, time, random, urllib.request, subprocess, base64, re
 import websocket
 
-HOST = os.environ["RESULT_HOST"].strip().lower()
+HOST = os.environ["RESULT_HOST"].strip().lower().replace("www.", "")
 TARGET = os.environ["RESULT_TEXT"].strip().lower()
 ARTIFACTS = os.environ["ARTIFACTS"]
+SAFE_KW = os.environ.get("SAFE_KW", "kw")
 
 def get_tabs():
     with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=8) as r:
@@ -315,8 +315,10 @@ def cdp(method, **params):
                     return msg.get("result", {})
         except Exception as e:
             print(f"CDP err ({attempt+1}): {e}", flush=True)
-            try: ws.close()
-            except Exception: pass
+            try:
+                ws.close()
+            except Exception:
+                pass
             time.sleep(2)
             new = find_target_tab() or find_serp_tab()
             if not new:
@@ -332,38 +334,195 @@ def js(expr):
     r = cdp("Runtime.evaluate", expression=expr, returnByValue=True)
     return r.get("result", {}).get("value")
 
-cdp("Page.enable"); cdp("Runtime.enable"); cdp("Network.enable")
+cdp("Page.enable")
+cdp("Runtime.enable")
+cdp("Network.enable")
 print(f"domain={HOST}  keyword={TARGET}", flush=True)
 
 KW_TOKENS = [w for w in TARGET.replace("-", " ").split() if len(w) > 2][:8]
 
-FIND_JS = """(() => {
+# Full SERP scrape – all organic results with decoded Bing redirects
+SCRAPE_JS = r"""(() => {
+  const HOST = %s;
+  function decodeBingHref(href) {
+    try {
+      const u = new URL(href, location.href);
+      // Bing ck redirect: &u=a1XXXX (base64 of target URL after a1 prefix)
+      const uParam = u.searchParams.get('u');
+      if (uParam) {
+        let raw = uParam;
+        if (raw.startsWith('a1')) raw = raw.slice(2);
+        try {
+          const pad = '='.repeat((4 - (raw.length %% 4)) %% 4);
+          const decoded = atob(raw + pad);
+          if (decoded.startsWith('http')) return decoded;
+        } catch (e) {}
+        try {
+          // sometimes URL-safe base64
+          raw = raw.replace(/-/g, '+').replace(/_/g, '/');
+          const pad = '='.repeat((4 - (raw.length %% 4)) %% 4);
+          const decoded = atob(raw + pad);
+          if (decoded.startsWith('http')) return decoded;
+        } catch (e) {}
+      }
+      // r= parameter
+      const r = u.searchParams.get('r');
+      if (r && r.startsWith('http')) return r;
+    } catch (e) {}
+    return href;
+  }
+  function hostOf(url) {
+    try {
+      return new URL(url).hostname.replace(/^www\./, '').toLowerCase();
+    } catch (e) {
+      return '';
+    }
+  }
+  const vis = e => {
+    const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+    return r.width > 4 && r.height > 4 && st.visibility !== 'hidden' && st.display !== 'none';
+  };
+  const results = [];
+  const seen = new Set();
+  // Prefer classic Bing organic cards
+  let cards = [...document.querySelectorAll('li.b_algo, .b_algo, #b_results > li, .b_results > li')];
+  if (!cards.length) {
+    cards = [...document.querySelectorAll('#b_results li, ol#b_results > li, [data-bm]')];
+  }
+  // Fallback: any block that looks like a result
+  if (!cards.length) {
+    cards = [...document.querySelectorAll('main li, #b_content li')].filter(el => {
+      return el.querySelector('h2, h3, a') && (el.innerText || '').length > 30;
+    });
+  }
+  for (const card of cards) {
+    const citeEl = card.querySelector('cite, .b_attribution, .b_cite, [class*="cite"]');
+    const citeText = (citeEl ? citeEl.innerText : '') || '';
+    const titleEl = card.querySelector('h2, h3, [role="heading"]') || card.querySelector('a');
+    const title = (titleEl ? titleEl.innerText : '').trim().slice(0, 160);
+    const links = [...card.querySelectorAll('a[href]')];
+    let bestHref = '';
+    let decoded = '';
+    let domain = '';
+    for (const a of links) {
+      const href = a.href || '';
+      if (!href || href.startsWith('javascript:')) continue;
+      const d = decodeBingHref(href);
+      const h = hostOf(d);
+      if (!h || h.includes('bing.com') || h.includes('microsoft.com') || h.includes('msn.com')) continue;
+      bestHref = href;
+      decoded = d;
+      domain = h;
+      break;
+    }
+    // Domain from cite if href decode failed
+    if (!domain && citeText) {
+      const m = citeText.toLowerCase().match(/([a-z0-9][-a-z0-9]*\.(?:com|net|org|io|co|uk|info|biz|app)(?:\.[a-z]{2})?)/);
+      if (m) domain = m[1].replace(/^www\./, '');
+    }
+    if (!domain && !title) continue;
+    const key = domain + '|' + title.slice(0, 40);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const tapEl = titleEl || links[0] || card;
+    const r = tapEl.getBoundingClientRect();
+    const cardText = (card.innerText || '').toLowerCase();
+    results.push({
+      position: results.length + 1,
+      domain: domain,
+      title: title,
+      cite: citeText.trim().slice(0, 120),
+      href: bestHref.slice(0, 300),
+      decoded_url: decoded.slice(0, 300),
+      is_target: domain.includes(HOST) || cardText.includes(HOST) || (decoded || '').toLowerCase().includes(HOST),
+      x: r.left + r.width / 2,
+      y: r.top + r.height / 2,
+      visible: vis(tapEl)
+    });
+  }
+  // Also collect every unique external domain from any link on page (extra safety)
+  const allDomains = [];
+  const domSeen = new Set();
+  for (const a of document.querySelectorAll('a[href]')) {
+    const d = hostOf(decodeBingHref(a.href || ''));
+    if (!d || d.includes('bing.') || d.includes('microsoft.') || d.includes('msn.') || d.includes('live.com')) continue;
+    if (domSeen.has(d)) continue;
+    domSeen.add(d);
+    allDomains.push(d);
+  }
+  return JSON.stringify({
+    page_url: location.href,
+    page_title: document.title,
+    result_count: results.length,
+    target_host: HOST,
+    target_found_in_results: results.some(r => r.is_target),
+    target_found_in_all_domains: allDomains.some(d => d.includes(HOST)),
+    results: results,
+    all_domains_on_page: allDomains,
+    innerH: window.innerHeight,
+    innerW: window.innerWidth,
+    scrollY: window.scrollY,
+    maxY: Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
+  });
+})()""" % json.dumps(HOST)
+
+# Finder: match target using scrape data + decode
+FIND_JS = r"""(() => {
   const HOST = %s;
   const TOKENS = %s;
+  function decodeBingHref(href) {
+    try {
+      const u = new URL(href, location.href);
+      const uParam = u.searchParams.get('u');
+      if (uParam) {
+        let raw = uParam.startsWith('a1') ? uParam.slice(2) : uParam;
+        for (const r of [raw, raw.replace(/-/g, '+').replace(/_/g, '/')]) {
+          try {
+            const pad = '='.repeat((4 - (r.length %% 4)) %% 4);
+            const decoded = atob(r + pad);
+            if (decoded.startsWith('http')) return decoded;
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
+    return href;
+  }
+  function hostOf(url) {
+    try { return new URL(url).hostname.replace(/^www\./, '').toLowerCase(); } catch (e) { return ''; }
+  }
   const vis = e => {
     const r = e.getBoundingClientRect(), st = getComputedStyle(e);
     return r.width > 6 && r.height > 6 && st.visibility !== 'hidden' && st.display !== 'none';
   };
-  const cards = [...document.querySelectorAll('li.b_algo, .b_algo, [class*="algo"], article, .b_results > li')];
-  const extra = [...document.querySelectorAll('li, div, section')].filter(el => {
-    const t = (el.innerText || '').toLowerCase();
-    return t.includes(HOST) || t.includes('gardengar');
-  });
-  const blocks = cards.length ? cards : extra;
+  let cards = [...document.querySelectorAll('li.b_algo, .b_algo, #b_results > li, .b_results > li')];
+  if (!cards.length) cards = [...document.querySelectorAll('#b_results li, [data-bm]')];
+  if (!cards.length) {
+    cards = [...document.querySelectorAll('main li, #b_content li')].filter(el =>
+      el.querySelector('h2,h3,a') && (el.innerText||'').length > 30);
+  }
   const candidates = [];
-  for (const card of blocks) {
+  for (const card of cards) {
     const text = (card.innerText || '').toLowerCase();
-    if (!text.includes(HOST) && !text.includes('gardengar')) continue;
-    let a = [...card.querySelectorAll('a[href]')].find(x => {
-      const h = (x.href || '').toLowerCase();
-      return h.includes(HOST) && !h.includes('bing.com');
-    });
-    if (!a) a = card.querySelector('h2 a, h3 a, a') || card.querySelector('a[href]');
+    const cite = ((card.querySelector('cite, .b_attribution, .b_cite') || {}).innerText || '').toLowerCase();
+    let matched = text.includes(HOST) || cite.includes(HOST);
+    let a = null;
+    let decoded = '';
+    for (const link of card.querySelectorAll('a[href]')) {
+      const d = decodeBingHref(link.href || '');
+      const h = hostOf(d);
+      if (h.includes(HOST) || d.toLowerCase().includes(HOST)) {
+        matched = true;
+        a = link;
+        decoded = d;
+        break;
+      }
+    }
+    if (!matched) continue;
+    if (!a) a = card.querySelector('h2 a, h3 a, a');
     if (!a || !vis(a)) continue;
-    let score = 25;
-    const href = (a.href || '').toLowerCase();
-    if (href.includes(HOST)) score += 15;
-    if (a.querySelector('h2, h3') || a.closest('h2, h3')) score += 8;
+    let score = 30;
+    if (cite.includes(HOST) || text.includes(HOST)) score += 20;
+    if (decoded.toLowerCase().includes(HOST) || (a.href || '').toLowerCase().includes(HOST)) score += 15;
     for (const t of TOKENS) {
       if (text.includes(t)) score += 2;
     }
@@ -374,18 +533,16 @@ FIND_JS = """(() => {
       tag: titleEl.tagName,
       text: (titleEl.innerText || a.innerText || '').trim().slice(0, 120),
       href: a.href,
+      decoded: decoded.slice(0, 200),
       x: r.left + r.width / 2,
       y: r.top + r.height / 2,
       score
     });
   }
   candidates.sort((x, y) => y.score - x.score);
-  const titles = [...document.querySelectorAll('h2, h3, [role=heading], cite')]
-    .map(e => (e.innerText || '').trim()).filter(Boolean).slice(0, 12);
   return JSON.stringify({
     found: candidates[0] || null,
     count: candidates.length,
-    titles,
     innerH: window.innerHeight,
     innerW: window.innerWidth,
     scrollY: window.scrollY,
@@ -393,19 +550,91 @@ FIND_JS = """(() => {
   });
 })()""" % (json.dumps(HOST), json.dumps(KW_TOKENS))
 
+
+def save_fail_debug(reason):
+    """Scrape full page-1 results and write fail-only artifacts."""
+    try:
+        scrape = js(SCRAPE_JS) or "{}"
+        data = json.loads(scrape)
+    except Exception as e:
+        data = {"error": str(e), "raw": None}
+        scrape = json.dumps(data)
+    path_json = os.path.join(ARTIFACTS, f"FAIL-serp-{SAFE_KW}.json")
+    path_txt = os.path.join(ARTIFACTS, f"FAIL-serp-{SAFE_KW}.txt")
+    with open(path_json, "w") as f:
+        f.write(json.dumps(data, indent=2))
+    lines = [
+        f"keyword: {TARGET}",
+        f"target_domain: {HOST}",
+        f"reason: {reason}",
+        f"page_url: {data.get('page_url', '')}",
+        f"target_found_in_results: {data.get('target_found_in_results')}",
+        f"target_found_in_all_domains: {data.get('target_found_in_all_domains')}",
+        f"result_count: {data.get('result_count')}",
+        "",
+        "=== ALL DOMAINS ON PAGE 1 ===",
+    ]
+    for d in data.get("all_domains_on_page") or []:
+        mark = " <<<< TARGET" if HOST in d else ""
+        lines.append(f"  - {d}{mark}")
+    lines.append("")
+    lines.append("=== ORGANIC RESULTS (position, domain, title) ===")
+    for r in data.get("results") or []:
+        mark = " <<<< TARGET MATCH" if r.get("is_target") else ""
+        lines.append(f"  #{r.get('position')}  domain={r.get('domain')}{mark}")
+        lines.append(f"      title: {r.get('title')}")
+        lines.append(f"      cite:  {r.get('cite')}")
+        lines.append(f"      decoded: {r.get('decoded_url', '')[:120]}")
+        lines.append(f"      xy=({r.get('x'):.0f},{r.get('y'):.0f}) visible={r.get('visible')}")
+    with open(path_txt, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"FAIL debug written: {path_txt}", flush=True)
+    print(f"  target_found_in_results={data.get('target_found_in_results')} domains={data.get('all_domains_on_page')}", flush=True)
+    # screenshot only on fail
+    try:
+        subprocess.run(
+            ["adb", "exec-out", "screencap", "-p"],
+            stdout=open(os.path.join(ARTIFACTS, f"FAIL-serp-{SAFE_KW}.png"), "wb"),
+            check=False,
+        )
+    except Exception:
+        pass
+    return data
+
+
 def smooth_scroll(dist, x, y):
     cdp("Input.synthesizeScrollGesture", x=x, y=y, yDistance=-dist,
         speed=450, gestureSourceType="touch")
     time.sleep(1.1)
 
+
 def is_target(url):
     u = (url or "").lower()
     return HOST in u and "bing." not in u and "chrome-error" not in u
 
+
+# Wait for results to paint
+for _ in range(10):
+    try:
+        body = js("document.body && document.body.innerText ? document.body.innerText.length : 0") or 0
+        if body > 400:
+            break
+    except Exception:
+        pass
+    time.sleep(1)
+
 print("=== SERP page 1 only ===", flush=True)
+# Initial scrape log (console only – not artifact unless fail)
+try:
+    pre = json.loads(js(SCRAPE_JS) or "{}")
+    print(f"  scrape: {pre.get('result_count', 0)} results, domains={pre.get('all_domains_on_page', [])[:12]}", flush=True)
+    print(f"  target_in_results={pre.get('target_found_in_results')} target_in_domains={pre.get('target_found_in_all_domains')}", flush=True)
+except Exception as e:
+    print(f"  pre-scrape err: {e}", flush=True)
+
 success = False
 stale_bottom = 0
-for attempt in range(35):
+for attempt in range(40):
     try:
         cur = (js("location.href") or "").lower()
         if is_target(cur):
@@ -422,17 +651,17 @@ for attempt in range(35):
     scrollY = info.get("scrollY", 0)
     maxY = info.get("maxY", 0)
 
-    if attempt % 7 == 0:
-        print(f"  candidates={info.get('count',0)} scroll={scrollY:.0f}/{maxY:.0f}", flush=True)
-        if info.get("titles"):
-            print(f"  titles: {info.get('titles')[:4]}", flush=True)
+    if attempt % 5 == 0:
+        print(f"  attempt={attempt} candidates={info.get('count', 0)} scroll={scrollY:.0f}/{maxY:.0f}", flush=True)
+        if found:
+            print(f"  best: '{found.get('text', '')[:60]}' score={found.get('score')}", flush=True)
 
-    if found and 40 < found["y"] < H - 40:
-        print(f"found '{found['text']}' score={found.get('score')}", flush=True)
+    if found and 30 < found["y"] < H - 30:
+        print(f"found '{found['text']}' score={found.get('score')} y={found['y']:.0f}", flush=True)
         cdp("Input.synthesizeTapGesture", x=found["x"], y=found["y"])
         print("real organic tap", flush=True)
-        for w in range(16):
-            time.sleep(1.3)
+        for w in range(18):
+            time.sleep(1.2)
             try:
                 now = (js("location.href") or "").lower()
                 if is_target(now):
@@ -443,20 +672,24 @@ for attempt in range(35):
                 pass
             t = find_target_tab()
             if t:
-                try: ws.close()
-                except Exception: pass
+                try:
+                    ws.close()
+                except Exception:
+                    pass
                 tab = t
                 ws = websocket.create_connection(
                     tab["webSocketDebuggerUrl"], timeout=120,
                     suppress_origin=True, ping_interval=12, ping_timeout=8
                 )
-                cdp("Page.enable"); cdp("Runtime.enable"); cdp("Network.enable")
+                cdp("Page.enable")
+                cdp("Runtime.enable")
+                cdp("Network.enable")
                 print("SUCCESS: target tab", flush=True)
                 success = True
                 break
         if success:
             break
-        print("  tap did not land on domain – continue page 1", flush=True)
+        print("  tap did not land – continue", flush=True)
         continue
 
     if found:
@@ -465,7 +698,7 @@ for attempt in range(35):
         if maxY > 0 and scrollY >= maxY - 40:
             stale_bottom += 1
             if stale_bottom >= 2:
-                print("  end of SERP page 1 – domain not found for this keyword", flush=True)
+                print("  end of SERP page 1", flush=True)
                 break
             smooth_scroll(-int(H * 0.2), int(W / 2), int(H * 0.5))
         else:
@@ -474,23 +707,15 @@ for attempt in range(35):
 
 if not success:
     print("KEYWORD_MISS", flush=True)
-    try:
-        open(os.path.join(ARTIFACTS, "page-debug.json"), "w").write(js(FIND_JS) or "{}")
-    except Exception:
-        pass
+    save_fail_debug("domain not found or tap failed on page 1")
     ws.close()
     sys.exit(1)
 
-# ---- engagement ----
-subprocess.run(["adb", "exec-out", "screencap", "-p"],
-               stdout=open(os.path.join(ARTIFACTS, "03-organic-landed.png"), "wb"), check=False)
-time.sleep(2)
-subprocess.run(["adb", "exec-out", "screencap", "-p"],
-               stdout=open(os.path.join(ARTIFACTS, "04-organic-settled.png"), "wb"), check=False)
-
+# ---- engagement (no screenshots on success) ----
 NUM_PAGES = random.randint(4, 6)
 MIN_DWELL, MAX_DWELL = 55, 110
-print("\n=== ENGAGEMENT ===", flush=True)
+print("\n=== ENGAGEMENT (no success screenshots) ===", flush=True)
+
 
 def page_dims():
     return json.loads(js("""(() => JSON.stringify({
@@ -498,6 +723,7 @@ def page_dims():
         scrollY: window.scrollY,
         maxY: Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
     }))()""") or "{}")
+
 
 def smooth_scroll_random(sec):
     end = time.time() + sec
@@ -531,6 +757,7 @@ def smooth_scroll_random(sec):
             break
         time.sleep(min(pause, remaining))
     print(f"  {count} scrolls", flush=True)
+
 
 def find_good_links():
     raw = js("""(() => {
@@ -570,6 +797,7 @@ def find_good_links():
     except Exception:
         return []
 
+
 visited = set()
 print("starting on:", js("location.href"), flush=True)
 for page_num in range(1, NUM_PAGES + 1):
@@ -577,12 +805,6 @@ for page_num in range(1, NUM_PAGES + 1):
     dwell = random.randint(MIN_DWELL, MAX_DWELL)
     print(f"  dwell ~{dwell}s", flush=True)
     smooth_scroll_random(dwell)
-    try:
-        name = f"0{4 + page_num}-page{page_num}.png"
-        subprocess.run(["adb", "exec-out", "screencap", "-p"],
-                       stdout=open(os.path.join(ARTIFACTS, name), "wb"), check=False)
-    except Exception:
-        pass
     if page_num >= NUM_PAGES:
         break
     links = find_good_links()
@@ -605,8 +827,6 @@ for page_num in range(1, NUM_PAGES + 1):
 
 print("\n===== FINAL =====", flush=True)
 smooth_scroll_random(random.randint(40, 70))
-subprocess.run(["adb", "exec-out", "screencap", "-p"],
-               stdout=open(os.path.join(ARTIFACTS, "09-final.png"), "wb"), check=False)
 print("visited:", list(visited), flush=True)
 ws.close()
 print("DONE", flush=True)
@@ -640,11 +860,11 @@ skip_chrome_welcome
 open_url "$TARGET_URL"
 sleep 6
 dismiss_chrome_sheets
-screenshot "01-bing-home.png"
+# no home screenshot on success path
 
 install_websocket || {
   log "Cannot install websocket-client – aborting"
-  screenshot "03-failed.png"
+  screenshot_fail "FAIL-websocket.png"
   exit 1
 }
 
@@ -661,13 +881,13 @@ for kw in "${KW_ARR[@]}"; do
 done
 
 if [[ "$HIT" == "1" ]]; then
-  screenshot "10-engagement-done.png"
-  log "SUCCESS – $MARKETNAME"
+  log "SUCCESS – $MARKETNAME (no success screenshots saved)"
   log "done"
-  ls -la "$ARTIFACTS"
+  # keep only identity.txt from success runs
+  ls -la "$ARTIFACTS" || true
   exit 0
 fi
 
-log "ALL keywords missed on page 1 – no traffic this run"
-screenshot "03-failed-all-keywords.png"
+log "ALL keywords missed on page 1 – see FAIL-serp-*.json/txt/png in artifacts"
+screenshot_fail "FAIL-all-keywords.png"
 exit 0
